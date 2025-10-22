@@ -1,0 +1,9 @@
+# Не загружать в Git
+.env
+*.db
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+*.pyo
+*.log
