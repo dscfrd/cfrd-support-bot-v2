@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+
+# Old backup files
+bot_old.py
+*_old.py
