@@ -37,22 +37,28 @@ app = Client(
 
 async def schedule_checks():
     """Планировщик проверок неотвеченных сообщений"""
-    # Начальная задержка
-    await asyncio.sleep(30)
+    try:
+        # Начальная задержка
+        await asyncio.sleep(30)
 
-    while True:
-        try:
-            logger.info("Запуск проверки неотвеченных сообщений...")
-            await check_unanswered_messages(app)
+        while True:
+            try:
+                logger.info("Запуск проверки неотвеченных сообщений...")
+                await check_unanswered_messages(app)
 
-            await asyncio.sleep(CHECK_INTERVAL * 60)
-        except Exception as e:
-            logger.error(f"Ошибка в планировщике проверок: {e}")
-            await asyncio.sleep(60)
+                await asyncio.sleep(CHECK_INTERVAL * 60)
+            except Exception as e:
+                logger.error(f"Ошибка в планировщике проверок: {e}")
+                await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("Задача проверки неотвеченных сообщений отменена")
+        raise
 
 
 async def main():
     """Главная функция"""
+    background_tasks = []
+
     try:
         logger.info("Запуск CFRD Support Bot v2...")
 
@@ -70,8 +76,8 @@ async def main():
         logger.info(f"Бот запущен. Группа поддержки: {SUPPORT_GROUP_ID}")
 
         # Запуск фоновых задач
-        app.loop.create_task(schedule_checks())
-        app.loop.create_task(cleanup_media_groups())
+        background_tasks.append(asyncio.create_task(schedule_checks()))
+        background_tasks.append(asyncio.create_task(cleanup_media_groups()))
         logger.info("Фоновые задачи запущены")
 
         # Держим бота запущенным
@@ -83,8 +89,21 @@ async def main():
         logger.error(f"Критическая ошибка: {e}")
         raise
     finally:
-        await app.stop()
-        logger.info("Бот остановлен")
+        # Отменяем фоновые задачи
+        logger.info("Остановка фоновых задач...")
+        for task in background_tasks:
+            task.cancel()
+
+        # Ждём завершения отмены задач
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        # Останавливаем клиент
+        try:
+            await app.stop()
+            logger.info("Бот остановлен")
+        except Exception as e:
+            logger.error(f"Ошибка при остановке бота: {e}")
 
 
 if __name__ == "__main__":

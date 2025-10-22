@@ -50,24 +50,28 @@ async def process_manager_media_group_after_delay(client, media_group_id, delay=
 
 async def cleanup_media_groups():
     """Clean up old media groups"""
-    while True:
-        try:
-            await asyncio.sleep(300)  # Каждые 5 минут
+    try:
+        while True:
+            try:
+                await asyncio.sleep(300)  # Каждые 5 минут
 
-            current_time = datetime.datetime.now()
-            expired_groups = []
+                current_time = datetime.datetime.now()
+                expired_groups = []
 
-            for media_group_id, group_data in manager_media_groups.items():
-                timestamp = group_data.get("timestamp")
-                if timestamp and (current_time - timestamp).total_seconds() > 600:
-                    expired_groups.append(media_group_id)
+                for media_group_id, group_data in manager_media_groups.items():
+                    timestamp = group_data.get("timestamp")
+                    if timestamp and (current_time - timestamp).total_seconds() > 600:
+                        expired_groups.append(media_group_id)
 
-            for media_group_id in expired_groups:
-                del manager_media_groups[media_group_id]
-                logger.info(f"Удалена устаревшая медиа-группа {media_group_id}")
+                for media_group_id in expired_groups:
+                    del manager_media_groups[media_group_id]
+                    logger.info(f"Удалена устаревшая медиа-группа {media_group_id}")
 
-        except Exception as e:
-            logger.error(f"Ошибка при очистке медиа-групп: {e}")
+            except Exception as e:
+                logger.error(f"Ошибка при очистке медиа-групп: {e}")
+    except asyncio.CancelledError:
+        logger.info("Задача очистки медиа-групп отменена")
+        raise
 
 
 async def handle_client_media_group(client, message):
