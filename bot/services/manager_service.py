@@ -1,6 +1,7 @@
 """Manager operations service"""
 
 import logging
+from pyrogram import types
 from bot.database.queries import get_manager, save_message
 from bot.utils import format_signature_with_custom_emoji, format_card_with_custom_emoji
 
@@ -31,11 +32,28 @@ async def send_manager_reply_to_client(client, manager_id, client_id, reply_text
         # Формируем полное сообщение с подписью менеджера
         full_message = f"{reply_text}\n\n{signature_text}"
 
+        # Корректируем offset'ы entities для полного сообщения
+        adjusted_entities = None
+        if signature_entities:
+            # Длина текста до подписи (reply_text + "\n\n")
+            offset_adjustment = len(reply_text) + 2
+            adjusted_entities = []
+            for entity in signature_entities:
+                # Создаем новый entity с скорректированным offset
+                adjusted_entity = types.MessageEntity(
+                    type=entity.type,
+                    offset=entity.offset + offset_adjustment,
+                    length=entity.length,
+                    custom_emoji_id=entity.custom_emoji_id
+                )
+                adjusted_entities.append(adjusted_entity)
+            logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities с offset +{offset_adjustment}")
+
         # Отправляем сообщение клиенту с entities для кастомных эмодзи
         await client.send_message(
             chat_id=client_id,
             text=full_message,
-            entities=signature_entities
+            entities=adjusted_entities
         )
 
         # Сохраняем сообщение в базу данных
@@ -76,41 +94,63 @@ async def send_manager_media_to_client(client, manager_id, client_id, file_id, c
         else:
             full_caption = signature_text
 
+        # Корректируем offset'ы entities для полного caption
+        adjusted_entities = None
+        if signature_entities:
+            if caption:
+                # Длина текста до подписи (caption + "\n\n")
+                offset_adjustment = len(caption) + 2
+                adjusted_entities = []
+                for entity in signature_entities:
+                    # Создаем новый entity с скорректированным offset
+                    adjusted_entity = types.MessageEntity(
+                        type=entity.type,
+                        offset=entity.offset + offset_adjustment,
+                        length=entity.length,
+                        custom_emoji_id=entity.custom_emoji_id
+                    )
+                    adjusted_entities.append(adjusted_entity)
+                logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities для caption с offset +{offset_adjustment}")
+            else:
+                # Если caption нет, используем entities как есть
+                adjusted_entities = signature_entities
+                logger.info(f"📝 Используем {len(adjusted_entities)} entities без коррекции (нет caption)")
+
         # Отправляем медиафайл в зависимости от типа
         if media_type == "photo":
             await client.send_photo(
                 chat_id=client_id,
                 photo=file_id,
                 caption=full_caption,
-                caption_entities=signature_entities
+                caption_entities=adjusted_entities
             )
         elif media_type == "document":
             await client.send_document(
                 chat_id=client_id,
                 document=file_id,
                 caption=full_caption,
-                caption_entities=signature_entities
+                caption_entities=adjusted_entities
             )
         elif media_type == "video":
             await client.send_video(
                 chat_id=client_id,
                 video=file_id,
                 caption=full_caption,
-                caption_entities=signature_entities
+                caption_entities=adjusted_entities
             )
         elif media_type == "audio":
             await client.send_audio(
                 chat_id=client_id,
                 audio=file_id,
                 caption=full_caption,
-                caption_entities=signature_entities
+                caption_entities=adjusted_entities
             )
         elif media_type == "voice":
             await client.send_voice(
                 chat_id=client_id,
                 voice=file_id,
                 caption=full_caption,
-                caption_entities=signature_entities
+                caption_entities=adjusted_entities
             )
         else:
             logger.error(f"Неизвестный тип медиа: {media_type}")
