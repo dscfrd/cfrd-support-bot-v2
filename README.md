@@ -66,8 +66,55 @@ STORAGE_CHANNEL_ID=your_storage_channel_id
 
 ## Запуск
 
+### Вариант 1: Обычный запуск
 ```bash
 python main.py
+```
+
+### Вариант 2: Запуск через systemd (рекомендуется для production)
+
+1. Отредактируйте файл `cfrd-support-bot.service`:
+```bash
+nano cfrd-support-bot.service
+```
+
+Замените:
+- `YOUR_USER` на имя пользователя системы (например, `ubuntu`)
+- `/path/to/cfrd-support-bot-v2` на полный путь к проекту (например, `/home/ubuntu/cfrd-support-bot-v2`)
+
+2. Создайте директорию для логов:
+```bash
+sudo mkdir -p /var/log/cfrd-support-bot
+sudo chown YOUR_USER:YOUR_USER /var/log/cfrd-support-bot
+```
+
+3. Установите service:
+```bash
+sudo cp cfrd-support-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable cfrd-support-bot
+```
+
+4. Управление ботом:
+```bash
+# Запустить бота
+sudo systemctl start cfrd-support-bot
+
+# Остановить бота
+sudo systemctl stop cfrd-support-bot
+
+# Перезапустить бота
+sudo systemctl restart cfrd-support-bot
+
+# Проверить статус
+sudo systemctl status cfrd-support-bot
+
+# Посмотреть логи
+sudo journalctl -u cfrd-support-bot -f
+
+# Или логи из файлов
+tail -f /var/log/cfrd-support-bot/bot.log
+tail -f /var/log/cfrd-support-bot/bot-error.log
 ```
 
 ## Команды для менеджеров
