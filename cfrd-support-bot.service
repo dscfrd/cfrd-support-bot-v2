@@ -1,0 +1,19 @@
+[Unit]
+Description=CFRD Support Bot v2
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/cfrd-support-bot-v2
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=10
+
+# Логирование
+StandardOutput=append:/var/log/cfrd-support-bot/bot.log
+StandardError=append:/var/log/cfrd-support-bot/bot-error.log
+
+[Install]
+WantedBy=multi-user.target
