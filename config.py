@@ -14,6 +14,7 @@ CHECK_INTERVAL = 3             # Проверка каждые 3 минуты
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ID группы поддержки и канала хранилища
 SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID"))

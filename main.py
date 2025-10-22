@@ -5,9 +5,11 @@ Main entry point
 
 import asyncio
 import logging
+import signal
+import pyrogram
 from pyrogram import Client
 
-from config import API_ID, API_HASH, PHONE_NUMBER, SUPPORT_GROUP_ID, CHECK_INTERVAL
+from config import API_ID, API_HASH, PHONE_NUMBER, SUPPORT_GROUP_ID, CHECK_INTERVAL, BOT_TOKEN
 from bot.database import setup_database
 from bot.handlers.client_messages import setup_client_handlers
 from bot.handlers.manager_commands import setup_manager_handlers
@@ -27,11 +29,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Инициализация клиента
+from config import BOT_TOKEN
+
 app = Client(
-    "cfrd_support_bot",
+    "business_account",  # Вернуть старое имя сессии
     api_id=API_ID,
     api_hash=API_HASH,
-    phone_number=PHONE_NUMBER
+    phone_number=PHONE_NUMBER,
+    parse_mode=pyrogram.enums.ParseMode.MARKDOWN,
+    workers=16
 )
 
 
@@ -86,6 +92,38 @@ async def main():
         await app.stop()
         logger.info("Бот остановлен")
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    import pyrogram
+    import signal
+    
+    def signal_handler(signum, frame):
+        logger.info(f"Stop signal received ({signum}). Exiting...")
+        raise KeyboardInterrupt
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        logger.info("Запуск бота...")
+        
+        # Инициализация базы данных
+        setup_database()
+        logger.info("База данных инициализирована")
+        
+        # Регистрация обработчиков
+        setup_client_handlers(app)
+        setup_manager_handlers(app)
+        logger.info("Обработчики зарегистрированы")
+        
+        logger.info(f"Бот запущен. Группа поддержки: {SUPPORT_GROUP_ID}")
+        
+        # Запуск фоновых задач
+        app.loop.create_task(schedule_checks())
+        app.loop.create_task(cleanup_media_groups())
+        logger.info("Фоновые задачи запущены")
+        
+        # Запускаем бота
+        app.run()
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске: {e}")

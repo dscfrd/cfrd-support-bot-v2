@@ -1,5 +1,4 @@
 """Handlers for client private messages"""
-
 import logging
 from pyrogram import filters
 
@@ -14,6 +13,8 @@ from bot.services import create_thread_for_client, edit_thread_title
 from config import SUPPORT_GROUP_ID
 
 logger = logging.getLogger(__name__)
+
+
 
 
 async def forward_message_to_support(client, message, thread_id=None):
@@ -95,6 +96,8 @@ async def forward_message_to_support(client, message, thread_id=None):
 
 def setup_client_handlers(app):
     """Setup handlers for client messages"""
+    
+    logger.info("=== РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ CLIENT_MESSAGES ===")
 
     @app.on_message(filters.private & ~filters.command(["start"]))
     async def handle_private_messages(client, message):
