@@ -9,15 +9,29 @@ from bot.utils.emoji_mapper import get_custom_emoji_id, has_custom_emoji
 logger = logging.getLogger(__name__)
 
 
+def utf16_offset(text: str, pos: int) -> int:
+    """
+    Преобразовать позицию символа в UTF-16 offset
+
+    Args:
+        text: Исходный текст
+        pos: Позиция символа в строке Python
+
+    Returns:
+        Позиция в UTF-16 code units
+    """
+    return len(text[:pos].encode('utf-16-le')) // 2
+
+
 def find_emoji_positions(text: str) -> List[Tuple[str, int, int]]:
     """
-    Найти все эмодзи в тексте и их позиции
+    Найти все эмодзи в тексте и их позиции в UTF-16
 
     Args:
         text: Текст для поиска
 
     Returns:
-        Список кортежей (emoji, start_position, end_position)
+        Список кортежей (emoji, start_position_utf16, end_position_utf16)
     """
     # Регулярное выражение для поиска эмодзи
     emoji_pattern = re.compile(
@@ -40,9 +54,10 @@ def find_emoji_positions(text: str) -> List[Tuple[str, int, int]]:
     emoji_list = []
     for match in emoji_pattern.finditer(text):
         emoji = match.group()
-        start = match.start()
-        end = match.end()
-        emoji_list.append((emoji, start, end))
+        # Преобразуем позиции в UTF-16
+        start_utf16 = utf16_offset(text, match.start())
+        end_utf16 = utf16_offset(text, match.end())
+        emoji_list.append((emoji, start_utf16, end_utf16))
 
     return emoji_list
 
@@ -76,7 +91,7 @@ def create_custom_emoji_entities(text: str) -> Tuple[str, Optional[List[types.Me
                 custom_emoji_id=custom_emoji_id
             )
             entities.append(entity)
-            logger.info(f"✅ Создан entity для эмодзи '{emoji}' с ID {custom_emoji_id}")
+            logger.info(f"✅ Создан entity для эмодзи '{emoji}' с ID {custom_emoji_id}, offset={start}, length={end-start}")
 
     logger.info(f"🔍 Всего создано entities: {len(entities)}")
     return text, entities if entities else None

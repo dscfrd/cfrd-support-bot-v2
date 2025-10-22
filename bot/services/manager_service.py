@@ -8,6 +8,19 @@ from bot.utils import format_signature_with_custom_emoji, format_card_with_custo
 logger = logging.getLogger(__name__)
 
 
+def get_utf16_length(text: str) -> int:
+    """
+    Получить длину текста в UTF-16 code units (как требует Telegram API)
+
+    Args:
+        text: Текст для измерения
+
+    Returns:
+        Длина в UTF-16 code units
+    """
+    return len(text.encode('utf-16-le')) // 2
+
+
 async def send_manager_reply_to_client(client, manager_id, client_id, reply_text):
     """Send manager's reply to client"""
     try:
@@ -35,8 +48,8 @@ async def send_manager_reply_to_client(client, manager_id, client_id, reply_text
         # Корректируем offset'ы entities для полного сообщения
         adjusted_entities = None
         if signature_entities:
-            # Длина текста до подписи (reply_text + "\n\n")
-            offset_adjustment = len(reply_text) + 2
+            # Длина текста до подписи (reply_text + "\n\n") в UTF-16
+            offset_adjustment = get_utf16_length(reply_text + "\n\n")
             adjusted_entities = []
             for entity in signature_entities:
                 # Создаем новый entity с скорректированным offset
@@ -47,7 +60,9 @@ async def send_manager_reply_to_client(client, manager_id, client_id, reply_text
                     custom_emoji_id=entity.custom_emoji_id
                 )
                 adjusted_entities.append(adjusted_entity)
-            logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities с offset +{offset_adjustment}")
+            logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities с offset +{offset_adjustment} (UTF-16)")
+            logger.info(f"📝 Full message: {full_message}")
+            logger.info(f"📝 Entities: {adjusted_entities}")
 
         # Отправляем сообщение клиенту с entities для кастомных эмодзи
         await client.send_message(
@@ -98,8 +113,8 @@ async def send_manager_media_to_client(client, manager_id, client_id, file_id, c
         adjusted_entities = None
         if signature_entities:
             if caption:
-                # Длина текста до подписи (caption + "\n\n")
-                offset_adjustment = len(caption) + 2
+                # Длина текста до подписи (caption + "\n\n") в UTF-16
+                offset_adjustment = get_utf16_length(caption + "\n\n")
                 adjusted_entities = []
                 for entity in signature_entities:
                     # Создаем новый entity с скорректированным offset
@@ -110,11 +125,14 @@ async def send_manager_media_to_client(client, manager_id, client_id, file_id, c
                         custom_emoji_id=entity.custom_emoji_id
                     )
                     adjusted_entities.append(adjusted_entity)
-                logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities для caption с offset +{offset_adjustment}")
+                logger.info(f"📝 Скорректировано {len(adjusted_entities)} entities для caption с offset +{offset_adjustment} (UTF-16)")
+                logger.info(f"📝 Full caption: {full_caption}")
+                logger.info(f"📝 Entities: {adjusted_entities}")
             else:
                 # Если caption нет, используем entities как есть
                 adjusted_entities = signature_entities
                 logger.info(f"📝 Используем {len(adjusted_entities)} entities без коррекции (нет caption)")
+                logger.info(f"📝 Entities: {adjusted_entities}")
 
         # Отправляем медиафайл в зависимости от типа
         if media_type == "photo":
