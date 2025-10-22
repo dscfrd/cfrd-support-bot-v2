@@ -2,6 +2,7 @@
 
 import logging
 from bot.database.queries import get_manager, save_message
+from bot.utils import format_signature_with_custom_emoji, format_card_with_custom_emoji
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +23,19 @@ async def send_manager_reply_to_client(client, manager_id, client_id, reply_text
         # Распаковываем данные менеджера
         _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
 
-        # Формируем полное сообщение с подписью менеджера
-        signature = f"\n\n{emoji} {name}, {position}, доб. {extension}"
-        full_message = f"{reply_text}{signature}"
+        # Формируем подпись с кастомными эмодзи
+        signature_text, signature_entities = format_signature_with_custom_emoji(
+            emoji, name, position, extension
+        )
 
-        # Отправляем сообщение клиенту
+        # Формируем полное сообщение с подписью менеджера
+        full_message = f"{reply_text}\n\n{signature_text}"
+
+        # Отправляем сообщение клиенту с entities для кастомных эмодзи
         await client.send_message(
             chat_id=client_id,
-            text=full_message
+            text=full_message,
+            entities=signature_entities
         )
 
         # Сохраняем сообщение в базу данных
@@ -59,45 +65,52 @@ async def send_manager_media_to_client(client, manager_id, client_id, file_id, c
         # Распаковываем данные менеджера
         _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
 
-        # Формируем подпись с информацией о менеджере
-        signature = f"{emoji} {name}, {position}, доб. {extension}"
+        # Формируем подпись с кастомными эмодзи
+        signature_text, signature_entities = format_signature_with_custom_emoji(
+            emoji, name, position, extension
+        )
 
         # Добавляем текст к подписи, если он есть
         if caption:
-            full_caption = f"{caption}\n\n{signature}"
+            full_caption = f"{caption}\n\n{signature_text}"
         else:
-            full_caption = signature
+            full_caption = signature_text
 
         # Отправляем медиафайл в зависимости от типа
         if media_type == "photo":
             await client.send_photo(
                 chat_id=client_id,
                 photo=file_id,
-                caption=full_caption
+                caption=full_caption,
+                caption_entities=signature_entities
             )
         elif media_type == "document":
             await client.send_document(
                 chat_id=client_id,
                 document=file_id,
-                caption=full_caption
+                caption=full_caption,
+                caption_entities=signature_entities
             )
         elif media_type == "video":
             await client.send_video(
                 chat_id=client_id,
                 video=file_id,
-                caption=full_caption
+                caption=full_caption,
+                caption_entities=signature_entities
             )
         elif media_type == "audio":
             await client.send_audio(
                 chat_id=client_id,
                 audio=file_id,
-                caption=full_caption
+                caption=full_caption,
+                caption_entities=signature_entities
             )
         elif media_type == "voice":
             await client.send_voice(
                 chat_id=client_id,
                 voice=file_id,
-                caption=full_caption
+                caption=full_caption,
+                caption_entities=signature_entities
             )
         else:
             logger.error(f"Неизвестный тип медиа: {media_type}")
@@ -130,26 +143,25 @@ async def send_manager_card_to_client(client, manager_id, client_id):
         # Распаковываем данные менеджера
         _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
 
-        # Формируем текст карточки
-        card_text = f"{emoji} **{name}**\n"
-        card_text += f"_{position}_\n\n"
-        card_text += f"📞 Добавочный: {extension}\n"
-
-        if username:
-            card_text += f"💬 Telegram: @{username}"
+        # Формируем текст карточки с кастомными эмодзи
+        card_text, card_entities = format_card_with_custom_emoji(
+            emoji, name, position, extension, username
+        )
 
         # Отправляем карточку с фото, если оно есть
         if photo_file_id:
             await client.send_photo(
                 chat_id=client_id,
                 photo=photo_file_id,
-                caption=card_text
+                caption=card_text,
+                caption_entities=card_entities
             )
         else:
             # Если фото нет, отправляем просто текст
             await client.send_message(
                 chat_id=client_id,
-                text=card_text
+                text=card_text,
+                entities=card_entities
             )
 
         logger.info(f"Карточка менеджера {manager_id} отправлена клиенту {client_id}")
