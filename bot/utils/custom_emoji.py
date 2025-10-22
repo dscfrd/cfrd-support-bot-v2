@@ -50,22 +50,15 @@ def find_emoji_positions(text: str) -> List[Tuple[str, int, int]]:
 def create_custom_emoji_entities(text: str) -> Tuple[str, Optional[List[types.MessageEntity]]]:
     """
     Создать entities для кастомных эмодзи в тексте
-
-    Args:
-        text: Текст с обычными эмодзи
-
-    Returns:
-        Кортеж (text, entities):
-        - text: Исходный текст (не изменяется)
-        - entities: Список MessageEntity для кастомных эмодзи или None если не найдено
-
-    Примечание:
-        Функция находит все эмодзи в тексте, проверяет наличие маппинга на кастомные эмодзи,
-        и создает entities для замены обычных эмодзи на кастомные при отображении.
     """
+    logger.info(f"🔍 create_custom_emoji_entities вызвана для текста: {text}")
+
     emoji_positions = find_emoji_positions(text)
 
+    logger.info(f"🔍 Найдено эмодзи: {emoji_positions}")
+
     if not emoji_positions:
+        logger.info("🔍 Эмодзи не найдены")
         return text, None
 
     entities = []
@@ -73,8 +66,9 @@ def create_custom_emoji_entities(text: str) -> Tuple[str, Optional[List[types.Me
     for emoji, start, end in emoji_positions:
         custom_emoji_id = get_custom_emoji_id(emoji)
 
+        logger.info(f"🔍 Эмодзи '{emoji}' -> custom_id: {custom_emoji_id}")
+
         if custom_emoji_id:
-            # Создаем entity для кастомного эмодзи
             entity = types.MessageEntity(
                 type=types.enums.MessageEntityType.CUSTOM_EMOJI,
                 offset=start,
@@ -82,8 +76,9 @@ def create_custom_emoji_entities(text: str) -> Tuple[str, Optional[List[types.Me
                 custom_emoji_id=custom_emoji_id
             )
             entities.append(entity)
-            logger.debug(f"Создан entity для эмодзи '{emoji}' с ID {custom_emoji_id}")
+            logger.info(f"✅ Создан entity для эмодзи '{emoji}' с ID {custom_emoji_id}")
 
+    logger.info(f"🔍 Всего создано entities: {len(entities)}")
     return text, entities if entities else None
 
 
