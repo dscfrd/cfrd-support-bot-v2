@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=YOUR_USER
-WorkingDirectory=/path/to/cfrd-support-bot-v2
+User=root
+WorkingDirectory=/bot-v2
 Environment="PATH=/usr/bin:/usr/local/bin"
 ExecStart=/usr/bin/python3 main.py
 Restart=always
