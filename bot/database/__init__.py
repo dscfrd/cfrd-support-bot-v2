@@ -14,6 +14,12 @@ from .queries import (
     is_first_reply,
     get_managers_replied_to_client,
     get_client_info_by_thread,
+    update_client_message_time,
+    update_manager_reply_time,
+    assign_duty_manager,
+    get_duty_manager,
+    reset_thread_notification,
+    unpack_manager_data,
 )
 
 __all__ = [
@@ -31,4 +37,10 @@ __all__ = [
     "is_first_reply",
     "get_managers_replied_to_client",
     "get_client_info_by_thread",
+    "update_client_message_time",
+    "update_manager_reply_time",
+    "assign_duty_manager",
+    "get_duty_manager",
+    "reset_thread_notification",
+    "unpack_manager_data",
 ]
