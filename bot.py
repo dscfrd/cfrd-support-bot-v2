@@ -278,9 +278,6 @@ async def forward_message_to_support(client, message, thread_id=None):
             # Пробуем отправить сообщение в тред
             logger.info(f"Пересылка сообщения в тред {thread_id}")
 
-            # Детальное логирование для диагностики цитат
-            logger.info(f"DEBUG FULL MESSAGE: {repr(message)}")
-            
             try:
                 # Получаем ответственного менеджера для этого треда
                 duty_manager = get_duty_manager(db_connection, thread_id)
