@@ -1,0 +1,491 @@
+"""
+Модуль работы с базой данных SQLite
+"""
+
+import sqlite3
+import datetime
+import logging
+
+from config import DATABASE_NAME
+
+logger = logging.getLogger(__name__)
+
+
+def setup_database():
+    """Инициализация базы данных и создание таблиц"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+
+    # Таблица клиентов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS clients (
+        user_id INTEGER PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        username TEXT,
+        first_contact TIMESTAMP,
+        last_contact TIMESTAMP,
+        message_count INTEGER DEFAULT 1,
+        thread_id INTEGER DEFAULT NULL,
+        custom_id TEXT DEFAULT NULL
+    )
+    ''')
+
+    # Добавляем колонку custom_id, если её нет
+    try:
+        cursor.execute('SELECT custom_id FROM clients LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE clients ADD COLUMN custom_id TEXT DEFAULT NULL')
+        logger.info("Добавлена колонка custom_id в таблицу clients")
+
+    # Таблица сообщений
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message_text TEXT,
+        timestamp TIMESTAMP,
+        is_from_user BOOLEAN,
+        FOREIGN KEY (user_id) REFERENCES clients(user_id)
+    )
+    ''')
+
+    # Таблица менеджеров
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS managers (
+        manager_id INTEGER PRIMARY KEY,
+        emoji TEXT,
+        name TEXT,
+        position TEXT,
+        extension TEXT,
+        photo_file_id TEXT,
+        auth_date TEXT
+    )
+    ''')
+
+    # Добавляем колонку username в managers, если её нет
+    try:
+        cursor.execute('SELECT username FROM managers LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE managers ADD COLUMN username TEXT')
+        logger.info("Добавлена колонка username в таблицу managers")
+
+    # Таблица первых ответов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS first_replies (
+        thread_id INTEGER,
+        client_id INTEGER,
+        manager_id INTEGER,
+        timestamp TEXT,
+        PRIMARY KEY (thread_id, manager_id),
+        FOREIGN KEY (client_id) REFERENCES clients (user_id),
+        FOREIGN KEY (manager_id) REFERENCES managers (manager_id)
+    )
+    ''')
+
+    # Таблица ответственных менеджеров
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS duty_managers (
+        thread_id INTEGER PRIMARY KEY,
+        manager_username TEXT,
+        assigned_by INTEGER,
+        assigned_at TIMESTAMP
+    )
+    ''')
+
+    # Таблица статусов тредов
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS thread_status (
+        thread_id INTEGER PRIMARY KEY,
+        last_client_message TIMESTAMP,
+        last_manager_reply TIMESTAMP,
+        is_notified BOOLEAN DEFAULT 0,
+        last_notification TIMESTAMP,
+        notification_disabled BOOLEAN DEFAULT 0
+    )
+    ''')
+
+    # Таблица групп
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS group_threads (
+        group_id INTEGER PRIMARY KEY,
+        group_title TEXT,
+        thread_id INTEGER,
+        created_at TIMESTAMP
+    )
+    ''')
+
+    conn.commit()
+    return conn
+
+
+# === Клиенты ===
+
+def save_client(conn, user):
+    """Сохранить/обновить информацию о клиенте"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('SELECT message_count, thread_id FROM clients WHERE user_id = ?', (user.id,))
+    result = cursor.fetchone()
+
+    if result:
+        message_count = result[0] + 1
+        thread_id = result[1]
+        cursor.execute('''
+        UPDATE clients
+        SET last_contact = ?, message_count = ?
+        WHERE user_id = ?
+        ''', (current_time, message_count, user.id))
+    else:
+        thread_id = None
+        cursor.execute('''
+        INSERT INTO clients (user_id, first_name, last_name, username, first_contact, last_contact, thread_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user.id, user.first_name, user.last_name, user.username, current_time, current_time, thread_id))
+
+    conn.commit()
+    return thread_id
+
+
+def update_client_thread(conn, user_id, thread_id):
+    """Обновить thread_id клиента"""
+    cursor = conn.cursor()
+    cursor.execute('UPDATE clients SET thread_id = ? WHERE user_id = ?', (thread_id, user_id))
+    conn.commit()
+
+
+def get_client_by_thread(conn, thread_id):
+    """Получить клиента по thread_id"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM clients WHERE thread_id = ?', (thread_id,))
+    return cursor.fetchone()
+
+
+def get_all_active_threads(conn):
+    """Получить список всех активных тредов"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT
+        c.thread_id,
+        c.user_id,
+        c.first_name,
+        c.last_name,
+        c.username,
+        dm.manager_username AS assigned_manager,
+        (SELECT MAX(timestamp) FROM messages WHERE user_id = c.user_id) AS last_message_time
+    FROM
+        clients c
+    LEFT JOIN
+        duty_managers dm ON c.thread_id = dm.thread_id
+    WHERE
+        c.thread_id IS NOT NULL
+    ORDER BY
+        last_message_time DESC
+    ''')
+    return cursor.fetchall()
+
+
+# === Сообщения ===
+
+def save_message(conn, user_id, message_text, is_from_user=True, media_type=None):
+    """Сохранить сообщение"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    media_info = f" [{media_type}]" if media_type else ""
+    full_message = f"{message_text}{media_info}"
+
+    cursor.execute('''
+    INSERT INTO messages (user_id, message_text, timestamp, is_from_user)
+    VALUES (?, ?, ?, ?)
+    ''', (user_id, full_message, current_time, is_from_user))
+
+    conn.commit()
+
+
+# === Менеджеры ===
+
+def save_manager(conn, manager_id, emoji, name, position, extension, photo_file_id=None, username=None):
+    """Сохранить/обновить менеджера"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    INSERT OR REPLACE INTO managers (manager_id, emoji, name, position, extension, photo_file_id, auth_date, username)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (manager_id, emoji, name, position, extension, photo_file_id, current_time, username))
+
+    conn.commit()
+
+
+def get_manager(conn, manager_id):
+    """Получить данные менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM managers WHERE manager_id = ?', (manager_id,))
+    return cursor.fetchone()
+
+
+def update_manager_photo(conn, manager_id, photo_file_id):
+    """Обновить фото менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('UPDATE managers SET photo_file_id = ? WHERE manager_id = ?', (photo_file_id, manager_id))
+    conn.commit()
+
+
+def get_all_managers(conn):
+    """Получить список всех менеджеров"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT manager_id, username, name FROM managers')
+    return cursor.fetchall()
+
+
+# === Первые ответы ===
+
+def save_first_reply(conn, thread_id, client_id, manager_id):
+    """Сохранить первый ответ менеджера"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    SELECT * FROM first_replies WHERE thread_id = ? AND manager_id = ?
+    ''', (thread_id, manager_id))
+
+    if not cursor.fetchone():
+        cursor.execute('''
+        INSERT INTO first_replies (thread_id, client_id, manager_id, timestamp)
+        VALUES (?, ?, ?, ?)
+        ''', (thread_id, client_id, manager_id, current_time))
+        conn.commit()
+        return True
+    return False
+
+
+def is_first_reply(conn, thread_id, manager_id):
+    """Проверить, является ли ответ первым для менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT * FROM first_replies WHERE thread_id = ? AND manager_id = ?
+    ''', (thread_id, manager_id))
+    return cursor.fetchone() is None
+
+
+def get_managers_replied_to_client(conn, thread_id):
+    """Получить список менеджеров, отвечавших клиенту"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+        SELECT m.manager_id, m.username
+        FROM first_replies fr
+        JOIN managers m ON fr.manager_id = m.manager_id
+        WHERE fr.thread_id = ?
+        ''', (thread_id,))
+    except sqlite3.OperationalError:
+        cursor.execute('''
+        SELECT m.manager_id, NULL
+        FROM first_replies fr
+        JOIN managers m ON fr.manager_id = m.manager_id
+        WHERE fr.thread_id = ?
+        ''', (thread_id,))
+    return cursor.fetchall()
+
+
+# === Custom ID клиентов ===
+
+def set_custom_id(conn, user_id, custom_id):
+    """Установить произвольный ID клиенту (задаётся менеджером)"""
+    import re
+    cursor = conn.cursor()
+
+    # Проверяем формат: только русские буквы и цифры, минимум одна русская буква
+    if not re.match(r'^[А-Яа-я0-9]+$', custom_id):
+        return None, "ID может содержать только русские буквы и цифры"
+
+    # Должна быть хотя бы одна русская буква (чтобы отличать от thread_id)
+    if not re.search(r'[А-Яа-я]', custom_id):
+        return None, "ID должен содержать хотя бы одну русскую букву"
+
+    # Проверяем, не занят ли этот ID другим клиентом
+    cursor.execute('SELECT user_id FROM clients WHERE custom_id = ? AND user_id != ?', (custom_id, user_id))
+    existing = cursor.fetchone()
+    if existing:
+        return None, f"ID #{custom_id} уже занят другим клиентом"
+
+    # Устанавливаем ID
+    cursor.execute('UPDATE clients SET custom_id = ? WHERE user_id = ?', (custom_id, user_id))
+    conn.commit()
+
+    return custom_id, None
+
+
+def get_custom_id(conn, user_id):
+    """Получить текущий custom_id клиента"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT custom_id FROM clients WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def get_thread_id_by_custom_id(conn, custom_id):
+    """Получить thread_id и user_id по custom_id клиента"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT thread_id, user_id FROM clients WHERE custom_id = ?', (custom_id,))
+    result = cursor.fetchone()
+    if result:
+        return result[0], result[1]
+    return None, None
+
+
+def get_custom_id_by_thread(conn, thread_id):
+    """Получить custom_id по thread_id"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT custom_id FROM clients WHERE thread_id = ?', (thread_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+# === Ответственные менеджеры ===
+
+def get_duty_manager(conn, thread_id):
+    """Получить ответственного менеджера для треда"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT manager_username FROM duty_managers WHERE thread_id = ?', (thread_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def assign_duty_manager(conn, thread_id, manager_username, assigned_by):
+    """Назначить ответственного менеджера"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    INSERT OR REPLACE INTO duty_managers (thread_id, manager_username, assigned_by, assigned_at)
+    VALUES (?, ?, ?, ?)
+    ''', (thread_id, manager_username, assigned_by, current_time))
+
+    conn.commit()
+
+
+def remove_duty_manager(conn, thread_id):
+    """Удалить ответственного менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM duty_managers WHERE thread_id = ?', (thread_id,))
+    conn.commit()
+
+
+# === Статусы тредов ===
+
+def update_client_message_time(conn, thread_id):
+    """Обновить время последнего сообщения клиента"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    INSERT OR REPLACE INTO thread_status (thread_id, last_client_message, is_notified, notification_disabled)
+    VALUES (?, ?, 0, COALESCE((SELECT notification_disabled FROM thread_status WHERE thread_id = ?), 0))
+    ''', (thread_id, current_time, thread_id))
+
+    conn.commit()
+
+
+def update_manager_reply_time(conn, thread_id):
+    """Обновить время последнего ответа менеджера"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    UPDATE thread_status
+    SET last_manager_reply = ?, is_notified = 0
+    WHERE thread_id = ?
+    ''', (current_time, thread_id))
+
+    conn.commit()
+
+
+def get_unanswered_threads(conn):
+    """Получить треды без ответа менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT
+        ts.thread_id,
+        ts.last_client_message,
+        ts.last_manager_reply,
+        ts.is_notified,
+        ts.last_notification,
+        ts.notification_disabled,
+        c.first_name,
+        c.username,
+        dm.manager_username
+    FROM thread_status ts
+    LEFT JOIN clients c ON ts.thread_id = c.thread_id
+    LEFT JOIN duty_managers dm ON ts.thread_id = dm.thread_id
+    WHERE (ts.last_manager_reply IS NULL OR ts.last_client_message > ts.last_manager_reply)
+    AND ts.notification_disabled = 0
+    ''')
+    return cursor.fetchall()
+
+
+def mark_thread_notified(conn, thread_id):
+    """Пометить тред как уведомленный"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    UPDATE thread_status
+    SET is_notified = 1, last_notification = ?
+    WHERE thread_id = ?
+    ''', (current_time, thread_id))
+
+    conn.commit()
+
+
+def disable_thread_notifications(conn, thread_id):
+    """Отключить уведомления для треда"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE thread_status
+    SET notification_disabled = 1
+    WHERE thread_id = ?
+    ''', (thread_id,))
+    conn.commit()
+
+
+def enable_thread_notifications(conn, thread_id):
+    """Включить уведомления для треда"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE thread_status
+    SET notification_disabled = 0, is_notified = 0
+    WHERE thread_id = ?
+    ''', (thread_id,))
+    conn.commit()
+
+
+# === Группы ===
+
+def save_group_thread(conn, group_id, group_title, thread_id):
+    """Сохранить тред группы"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    cursor.execute('''
+    INSERT OR REPLACE INTO group_threads (group_id, group_title, thread_id, created_at)
+    VALUES (?, ?, ?, ?)
+    ''', (group_id, group_title, thread_id, current_time))
+
+    conn.commit()
+
+
+def get_group_thread(conn, group_id):
+    """Получить тред группы"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT thread_id, group_title FROM group_threads WHERE group_id = ?', (group_id,))
+    return cursor.fetchone()
+
+
+def get_group_by_thread(conn, thread_id):
+    """Получить группу по thread_id"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT group_id, group_title FROM group_threads WHERE thread_id = ?', (thread_id,))
+    return cursor.fetchone()

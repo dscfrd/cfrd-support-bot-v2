@@ -1,0 +1,19 @@
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Session files
+*.session
+*.session-journal
+
+# Database
+*.db
+
+# Secrets (if any)
+.env
+
+# Errors log
+unknown_errors.txt
