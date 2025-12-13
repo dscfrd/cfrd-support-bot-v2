@@ -20,6 +20,13 @@ def escape_markdown(text):
         text = text.replace(char, '\\' + char)
     return text
 
+
+def escape_html(text):
+    """Экранирует специальные символы HTML"""
+    if not text:
+        return ""
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
 # Импорт конфигурации
 from config import (
     API_ID, API_HASH, PHONE_NUMBER, SESSION_NAME,
@@ -75,6 +82,10 @@ set_custom_id = db.set_custom_id
 get_custom_id = db.get_custom_id
 get_thread_id_by_custom_id = db.get_thread_id_by_custom_id
 get_custom_id_by_thread = db.get_custom_id_by_thread
+save_message_mapping = db.save_message_mapping
+get_group_message_id = db.get_group_message_id
+get_client_message_id = db.get_client_message_id
+update_message_text = db.update_message_text
 
 # === ДЕКОРАТОР ДЛЯ ОБРАБОТКИ FLOOD WAIT ===
 def handle_flood_wait(max_retries=3, initial_delay=1):
@@ -148,8 +159,8 @@ async def create_support_thread(client, thread_title_base):
         thread_title = f"{thread_id}: {thread_title_base}"
         try:
             await client.invoke(
-                pyrogram.raw.functions.channels.EditForumTopic(
-                    channel=peer,
+                pyrogram.raw.functions.messages.EditForumTopic(
+                    peer=peer,
                     topic_id=thread_id,
                     title=thread_title
                 )
@@ -271,6 +282,71 @@ async def create_thread_for_client(client, user):
         return None
 
 
+# Вспомогательная функция для получения информации о пересылке (новый API forward_origin)
+def get_forward_info(message):
+    """
+    Возвращает (is_forwarded, is_from_chat, forward_from_name)
+    Использует новый API forward_origin вместо deprecated forward_from
+    """
+    is_forwarded = False
+    is_from_chat = False
+    forward_from_name = ""
+
+    if hasattr(message, 'forward_origin') and message.forward_origin:
+        is_forwarded = True
+        origin = message.forward_origin
+
+        # Проверяем тип origin
+        origin_type = getattr(origin, 'type', None)
+
+        if origin_type:
+            # Используем enum type
+            type_name = str(origin_type).lower()
+
+            if 'user' in type_name and 'hidden' not in type_name:
+                # MessageOriginType.USER - обычный пользователь
+                if hasattr(origin, 'sender_user') and origin.sender_user:
+                    user = origin.sender_user
+                    forward_from_name = escape_markdown(user.first_name or '')
+                    if user.last_name:
+                        forward_from_name += f" {escape_markdown(user.last_name)}"
+                    if user.username:
+                        forward_from_name += f" @{user.username}"
+
+            elif 'hidden' in type_name:
+                # MessageOriginType.HIDDEN_USER - скрытый пользователь
+                if hasattr(origin, 'sender_user_name') and origin.sender_user_name:
+                    forward_from_name = escape_markdown(origin.sender_user_name)
+
+            elif 'chat' in type_name or 'channel' in type_name:
+                # MessageOriginType.CHAT или CHANNEL
+                is_from_chat = True
+                if hasattr(origin, 'chat') and origin.chat:
+                    chat = origin.chat
+                    forward_from_name = escape_markdown(chat.title or "канала/группы")
+                    if chat.username:
+                        forward_from_name += f" @{chat.username}"
+        else:
+            # Fallback: проверяем атрибуты напрямую
+            if hasattr(origin, 'sender_user') and origin.sender_user:
+                user = origin.sender_user
+                forward_from_name = escape_markdown(user.first_name or '')
+                if user.last_name:
+                    forward_from_name += f" {escape_markdown(user.last_name)}"
+                if user.username:
+                    forward_from_name += f" @{user.username}"
+            elif hasattr(origin, 'sender_user_name') and origin.sender_user_name:
+                forward_from_name = escape_markdown(origin.sender_user_name)
+            elif hasattr(origin, 'chat') and origin.chat:
+                is_from_chat = True
+                chat = origin.chat
+                forward_from_name = escape_markdown(chat.title or "канала/группы")
+                if chat.username:
+                    forward_from_name += f" @{chat.username}"
+
+    return is_forwarded, is_from_chat, forward_from_name
+
+
 # Обновленный обработчик пересылки сообщения клиента в группу поддержки
 async def forward_message_to_support(client, message, thread_id=None):
     try:
@@ -297,17 +373,30 @@ async def forward_message_to_support(client, message, thread_id=None):
                 # Проверяем, является ли сообщение ответом на другое
                 reply_info = ""
                 quote_info = ""
+                reply_to_group_msg_id = None  # ID сообщения в группе для reply
+                use_html = False  # Флаг для использования HTML (для blockquote)
 
                 # Проверяем наличие цитаты (выделенный текст при ответе)
                 if hasattr(message, 'quote') and message.quote and hasattr(message.quote, 'text') and message.quote.text:
                     quote_text = message.quote.text
-                    if len(quote_text) > 150:
-                        quote_text = quote_text[:147] + "..."
-                    quote_text = escape_markdown(quote_text)
-                    quote_info = f"📝 Цитата: _{quote_text}_\n\n"
+                    if len(quote_text) > 200:
+                        quote_text = quote_text[:197] + "..."
+                    quote_text = escape_html(quote_text)
+                    quote_info = f"<blockquote>{quote_text}</blockquote>\n"
+                    use_html = True
 
                 if hasattr(message, 'reply_to_message') and message.reply_to_message:
                     reply_msg = message.reply_to_message
+
+                    # Ищем соответствующее сообщение в группе для reply
+                    try:
+                        mapping = get_group_message_id(db_connection, reply_msg.id, message.from_user.id)
+                        if mapping:
+                            reply_to_group_msg_id = mapping[0]
+                            logger.info(f"Найден маппинг: client_msg {reply_msg.id} -> group_msg {reply_to_group_msg_id}")
+                    except Exception as e:
+                        logger.debug(f"Не удалось найти маппинг сообщения: {e}")
+
                     # Получаем текст сообщения, на которое ответили (только если нет цитаты)
                     reply_text = ""
                     if not quote_info:  # Если уже есть цитата, не дублируем
@@ -334,35 +423,16 @@ async def forward_message_to_support(client, message, thread_id=None):
                         if len(reply_text) > 100:
                             reply_text = reply_text[:97] + "..."
                         reply_text = escape_markdown(reply_text)
-                        reply_info = f"↩️ В ответ на: _{reply_text}_\n\n"
+                        # Показываем текстовую информацию только если нет маппинга для reply
+                        if not reply_to_group_msg_id:
+                            reply_info = f"↩️ В ответ на: _{reply_text}_\n\n"
 
                 # Комбинируем цитату и reply_info
                 if quote_info:
                     reply_info = quote_info
 
-                # Проверяем пересланные сообщения
-                is_forwarded = False
-                is_forwarded_from_chat = False
-                forward_from_name = ""
-
-                if hasattr(message, 'forward_from') and message.forward_from:
-                    is_forwarded = True
-                    forward_from_name = escape_markdown(message.forward_from.first_name or '')
-                    if hasattr(message.forward_from, 'last_name') and message.forward_from.last_name:
-                        forward_from_name += f" {escape_markdown(message.forward_from.last_name)}"
-                    if hasattr(message.forward_from, 'username') and message.forward_from.username:
-                        forward_from_name += f" @{message.forward_from.username}"
-
-                elif hasattr(message, 'forward_sender_name') and message.forward_sender_name:
-                    is_forwarded = True
-                    forward_from_name = escape_markdown(message.forward_sender_name)
-
-                elif hasattr(message, 'forward_from_chat') and message.forward_from_chat:
-                    is_forwarded = True
-                    is_forwarded_from_chat = True
-                    forward_from_name = escape_markdown(message.forward_from_chat.title or "канала/группы")
-                    if hasattr(message.forward_from_chat, 'username') and message.forward_from_chat.username:
-                        forward_from_name += f" @{message.forward_from_chat.username}"
+                # Проверяем пересланные сообщения (используем новый API forward_origin)
+                is_forwarded, is_forwarded_from_chat, forward_from_name = get_forward_info(message)
 
                 # Проверяем наличие медиа и считаем количество
                 media_type = None
@@ -416,40 +486,96 @@ async def forward_message_to_support(client, message, thread_id=None):
                     media_info = f"\n+ {media_count} {media_label}"
 
                 # Собираем сообщение
-                if reply_info:
-                    if message_content:
-                        full_message = f"{message_header}\n{reply_info}{message_content}{media_info}"
+                if use_html:
+                    # HTML формат для цитат
+                    user_name_html = escape_html(message.from_user.first_name or "")
+                    if message.from_user.last_name:
+                        user_name_html += f" {escape_html(message.from_user.last_name)}"
+                    if message.from_user.username:
+                        user_name_html += f" @{message.from_user.username}"
+
+                    message_content_html = ""
+                    if hasattr(message, 'text') and message.text:
+                        message_content_html = escape_html(message.text)
+                    elif hasattr(message, 'caption') and message.caption:
+                        message_content_html = escape_html(message.caption)
+
+                    message_header_html = f"<b>{user_name_html}:</b>"
+                    media_info_html = f"\n+ {media_count} {media_label}" if media_type else ""
+
+                    if message_content_html:
+                        full_message = f"{message_header_html}\n{reply_info}{message_content_html}{media_info_html}"
                     else:
-                        full_message = f"{message_header}\n{reply_info}{media_info}"
+                        full_message = f"{message_header_html}\n{reply_info}{media_info_html}"
+                    parse_mode = pyrogram.enums.ParseMode.HTML
                 else:
-                    if message_content:
-                        full_message = f"{message_header}\n\n{message_content}{media_info}"
+                    # Markdown формат (стандартный)
+                    if reply_info:
+                        if message_content:
+                            full_message = f"{message_header}\n{reply_info}{message_content}{media_info}"
+                        else:
+                            full_message = f"{message_header}\n{reply_info}{media_info}"
                     else:
-                        full_message = f"{message_header}{media_info}"
-                
+                        if message_content:
+                            full_message = f"{message_header}\n\n{message_content}{media_info}"
+                        else:
+                            full_message = f"{message_header}{media_info}"
+                    parse_mode = pyrogram.enums.ParseMode.MARKDOWN
+
+                # Определяем на какое сообщение отвечать:
+                # - если есть маппинг (клиент ответил на конкретное сообщение) - reply на него
+                # - иначе просто в топик
+                target_reply_id = reply_to_group_msg_id if reply_to_group_msg_id else thread_id
+
                 # Отправляем сообщение в тред
-                await client.send_message(
+                sent_message = await client.send_message(
                     chat_id=SUPPORT_GROUP_ID,
                     text=full_message,
-                    reply_to_message_id=thread_id,
-                    parse_mode=pyrogram.enums.ParseMode.MARKDOWN
+                    reply_to_message_id=target_reply_id,
+                    parse_mode=parse_mode
                 )
-                
+
+                # Сохраняем маппинг сообщения клиента -> сообщения в группе
+                try:
+                    save_message_mapping(
+                        db_connection,
+                        client_message_id=message.id,
+                        group_message_id=sent_message.id,
+                        thread_id=thread_id,
+                        user_id=message.from_user.id,
+                        message_text=message.text or message.caption  # Сохраняем текст для отслеживания редактирования
+                    )
+                    logger.debug(f"Сохранён маппинг: client_msg {message.id} -> group_msg {sent_message.id}")
+                except Exception as map_err:
+                    logger.warning(f"Не удалось сохранить маппинг сообщения: {map_err}")
+
                 # Если это медиа, пробуем скопировать его отдельно без подписи
                 if media_type:
                     try:
-                        await client.copy_message(
+                        copied_message = await client.copy_message(
                             chat_id=SUPPORT_GROUP_ID,
                             from_chat_id=message.chat.id,
                             message_id=message.id,
-                            reply_to_message_id=thread_id,
+                            reply_to_message_id=target_reply_id,
                             caption=""  # Пустая подпись, т.к. текст уже отправлен
                         )
+                        # Сохраняем маппинг и для медиа-сообщения
+                        try:
+                            save_message_mapping(
+                                db_connection,
+                                client_message_id=message.id,
+                                group_message_id=copied_message.id,
+                                thread_id=thread_id,
+                                user_id=message.from_user.id
+                            )
+                        except:
+                            pass
                         logger.info(f"Медиа успешно скопировано в тред {thread_id}")
                     except Exception as media_error:
                         logger.error(f"Ошибка при копировании медиа: {media_error}")
-                
-                logger.info(f"Сообщение клиента отправлено в тред {thread_id}")
+
+                logger.info(f"Сообщение клиента отправлено в тред {thread_id}" +
+                           (f" (reply на {reply_to_group_msg_id})" if reply_to_group_msg_id else ""))
                 return True
             except Exception as e:
                 # Если это ошибка TOPIC_DELETED, нужно сообщить вызывающему коду
@@ -480,35 +606,52 @@ async def forward_message_to_support(client, message, thread_id=None):
         return False
 
 # Отправка сообщения от менеджера клиенту
-async def send_manager_reply_to_client(client, manager_id, client_id, message_text):
+async def send_manager_reply_to_client(client, manager_id, client_id, message_text, group_message_id=None, thread_id=None, reply_to_client_msg_id=None):
     try:
         # Получаем информацию о менеджере
         manager = get_manager(db_connection, manager_id)
         if not manager:
             logger.error(f"Менеджер с ID {manager_id} не найден в базе данных")
             return False
-        
+
         # Распаковываем данные менеджера (ID, emoji, name, position, extension, photo_id, auth_date, username)
         # Здесь теперь 8 значений вместо 7, учитываем username
         _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
-        
+
         # Формируем подпись менеджера (моноширинным)
         signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
 
         # Полное сообщение с подписью
         full_message = f"{message_text}{signature}"
 
-        # Отправляем сообщение клиенту
-        await client.send_message(
+        # Отправляем сообщение клиенту (с reply если указан)
+        sent_message = await client.send_message(
             chat_id=client_id,
             text=full_message,
+            reply_to_message_id=reply_to_client_msg_id,
             parse_mode=pyrogram.enums.ParseMode.MARKDOWN
         )
-        logger.info(f"Ответ менеджера отправлен клиенту {client_id}")
-        
+        reply_info = f" (reply на {reply_to_client_msg_id})" if reply_to_client_msg_id else ""
+        logger.info(f"Ответ менеджера отправлен клиенту {client_id}{reply_info}")
+
+        # Сохраняем маппинг сообщения (группа -> клиент)
+        if group_message_id and thread_id:
+            try:
+                save_message_mapping(
+                    db_connection,
+                    client_message_id=sent_message.id,
+                    group_message_id=group_message_id,
+                    thread_id=thread_id,
+                    user_id=client_id,
+                    message_text=message_text  # Сохраняем текст для возможного редактирования
+                )
+                logger.debug(f"Сохранён маппинг: group_msg {group_message_id} -> client_msg {sent_message.id}")
+            except Exception as map_err:
+                logger.warning(f"Не удалось сохранить маппинг сообщения: {map_err}")
+
         # Сохраняем сообщение в базу данных
         save_message(db_connection, client_id, full_message, is_from_user=False)
-        
+
         return True
     except Exception as e:
         logger.error(f"Ошибка при отправке ответа менеджера: {e}")
@@ -699,7 +842,11 @@ async def send_manager_media_group_to_client(client, manager_id, client_id, medi
 
         # Сначала подпись, потом файлы
         await client.send_message(chat_id=client_id, text=full_caption, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
-        await client.send_media_group(chat_id=client_id, media=media_group)
+        try:
+            await client.send_media_group(chat_id=client_id, media=media_group)
+        except TypeError as e:
+            if "topics" not in str(e):
+                raise
         logger.info(f"Медиа-группа от менеджера отправлена клиенту {client_id}")
 
         save_message(db_connection, client_id, f"{caption or '[Медиафайлы]'}{signature}", is_from_user=False, media_type="MEDIA_GROUP")
@@ -748,28 +895,9 @@ async def handle_client_media_group(client, message, thread_id=None):
                         if message.from_user.username:
                             user_name += f" @{message.from_user.username}"
 
-                        # Проверяем, пересланы ли файлы
+                        # Проверяем, пересланы ли файлы (используем новый API forward_origin)
                         first_msg = group_data["messages"][0]
-                        is_forwarded = False
-                        is_forwarded_from_chat = False
-                        forward_from_name = ""
-
-                        if hasattr(first_msg, 'forward_from') and first_msg.forward_from:
-                            is_forwarded = True
-                            forward_from_name = escape_markdown(first_msg.forward_from.first_name or '')
-                            if hasattr(first_msg.forward_from, 'last_name') and first_msg.forward_from.last_name:
-                                forward_from_name += f" {escape_markdown(first_msg.forward_from.last_name)}"
-                            if hasattr(first_msg.forward_from, 'username') and first_msg.forward_from.username:
-                                forward_from_name += f" @{first_msg.forward_from.username}"
-                        elif hasattr(first_msg, 'forward_sender_name') and first_msg.forward_sender_name:
-                            is_forwarded = True
-                            forward_from_name = escape_markdown(first_msg.forward_sender_name)
-                        elif hasattr(first_msg, 'forward_from_chat') and first_msg.forward_from_chat:
-                            is_forwarded = True
-                            is_forwarded_from_chat = True
-                            forward_from_name = escape_markdown(first_msg.forward_from_chat.title or "канала")
-                            if hasattr(first_msg.forward_from_chat, 'username') and first_msg.forward_from_chat.username:
-                                forward_from_name += f" @{first_msg.forward_from_chat.username}"
+                        is_forwarded, is_forwarded_from_chat, forward_from_name = get_forward_info(first_msg)
 
                         # Получаем caption из медиа-группы и экранируем
                         caption_text = next((msg.caption for msg in group_data["messages"] if msg.caption), "")
@@ -823,7 +951,15 @@ async def handle_client_media_group(client, message, thread_id=None):
                         kwargs = {"chat_id": SUPPORT_GROUP_ID, "media": media_list}
                         if thread_id:
                             kwargs["reply_to_message_id"] = thread_id
-                        await client.send_media_group(**kwargs)
+                        try:
+                            await client.send_media_group(**kwargs)
+                        except TypeError as e:
+                            # Баг в Pyrofork - Messages.__init__() missing 'topics'
+                            # Сообщения всё равно отправляются
+                            if "topics" in str(e):
+                                logger.debug(f"Игнорируем баг Pyrofork с topics: {e}")
+                            else:
+                                raise
                         logger.info(f"Отправлена медиа-группа с {len(media_list)} файлами в группу поддержки, тред {thread_id}")
 
                     save_message(db_connection, user_id,
@@ -941,10 +1077,9 @@ def get_client_info_by_thread(conn, thread_id):
 async def update_thread_title(client, thread_id, title):
     try:
         peer = await client.resolve_peer(SUPPORT_GROUP_ID)
-        
         await client.invoke(
-            pyrogram.raw.functions.channels.EditForumTopic(
-                channel=peer,
+            pyrogram.raw.functions.messages.EditForumTopic(
+                peer=peer,
                 topic_id=thread_id,
                 title=title
             )
@@ -952,6 +1087,10 @@ async def update_thread_title(client, thread_id, title):
         logger.info(f"Заголовок треда {thread_id} изменен на '{title}'")
         return True
     except Exception as e:
+        # Игнорируем ошибку "TOPIC_NOT_MODIFIED" - заголовок уже такой
+        if "TOPIC_NOT_MODIFIED" in str(e):
+            logger.debug(f"Тред {thread_id}: заголовок уже '{title}'")
+            return True
         logger.error(f"Ошибка при изменении заголовка треда {thread_id}: {e}")
         return False
 
@@ -994,20 +1133,25 @@ async def mark_thread_urgent(client, thread_id, is_urgent=True):
         # Обновляем заголовок
         peer = await client.resolve_peer(SUPPORT_GROUP_ID)
         await client.invoke(
-            pyrogram.raw.functions.channels.EditForumTopic(
-                channel=peer,
+            pyrogram.raw.functions.messages.EditForumTopic(
+                peer=peer,
                 topic_id=thread_id,
                 title=new_title
             )
         )
-        
+
         # Запоминаем новое состояние
         thread_title_states[thread_id] = {"has_alert": is_urgent, "title": new_title}
         
         logger.info(f"Заголовок треда {thread_id} изменен на '{new_title}'")
         return True
-            
+
     except Exception as e:
+        # Игнорируем ошибку "TOPIC_NOT_MODIFIED" - заголовок уже такой
+        if "TOPIC_NOT_MODIFIED" in str(e):
+            logger.debug(f"Тред {thread_id}: заголовок уже '{new_title}'")
+            thread_title_states[thread_id] = {"has_alert": is_urgent, "title": new_title}
+            return True
         logger.error(f"Ошибка при обновлении статуса треда {thread_id}: {e}")
         return False
 
@@ -1989,6 +2133,11 @@ async def handle_manager_media_in_group(client, message):
         logger.error(f"Ошибка при обработке медиа менеджера: {e}")
 
 
+# Обработчик reply менеджера на сообщение в треде - ОТКЛЮЧЕН
+# Теперь reply-логика встроена в команду /{thread_id}
+# async def handle_manager_reply_in_thread - см. handle_thread_number_command
+
+
 # Команда для получения информации
 @business.on_message(filters.command("myinfo") & filters.chat(SUPPORT_GROUP_ID))
 async def handle_myinfo(client, message):
@@ -2074,7 +2223,19 @@ async def handle_custom_id_command(client, message):
         signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
         full_message = f"{reply_text}{signature}"
 
-        await client.send_message(chat_id=client_id, text=full_message, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
+        sent_message = await client.send_message(chat_id=client_id, text=full_message, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
+
+        # Сохраняем маппинг для reply
+        try:
+            save_message_mapping(
+                db_connection,
+                client_message_id=sent_message.id,
+                group_message_id=message.id,
+                thread_id=thread_id,
+                user_id=client_id
+            )
+        except:
+            pass
 
         # Обновляем статус треда
         update_manager_reply_time(db_connection, thread_id)
@@ -2136,10 +2297,24 @@ async def handle_thread_number_command(client, message):
         if client_data:
             # Это тред клиента - отправляем личное сообщение
             client_id = client_data[0]
-            
-            # Отправляем ответ клиенту
-            success = await send_manager_reply_to_client(client, manager_id, client_id, reply_text)
-            
+
+            # Проверяем, есть ли reply на сообщение (для отправки клиенту как reply)
+            reply_to_client_msg_id = None
+            if message.reply_to_message:
+                # Ищем маппинг: group_message_id -> client_message_id
+                mapping = get_client_message_id(db_connection, message.reply_to_message.id, thread_id)
+                if mapping:
+                    reply_to_client_msg_id = mapping[0]
+                    logger.info(f"Команда /{thread_id} с reply: group_msg {message.reply_to_message.id} -> client_msg {reply_to_client_msg_id}")
+
+            # Отправляем ответ клиенту (с сохранением маппинга для reply)
+            success = await send_manager_reply_to_client(
+                client, manager_id, client_id, reply_text,
+                group_message_id=message.id,
+                thread_id=thread_id,
+                reply_to_client_msg_id=reply_to_client_msg_id
+            )
+
             if success:
                 # Обновляем время последнего ответа менеджера
                 update_manager_reply_time(db_connection, thread_id)
@@ -2387,22 +2562,23 @@ async def handle_set_custom_id(client, message):
 async def edit_thread_title(client, thread_id, new_title):
     try:
         logger.info(f"Попытка изменить заголовок треда {thread_id} на '{new_title}'")
-        
-        # Получаем peer объект группы
+
         peer = await client.resolve_peer(SUPPORT_GROUP_ID)
-        
-        # Вызываем API метод для изменения заголовка темы
-        result = await client.invoke(
-            pyrogram.raw.functions.channels.EditForumTopic(
-                channel=peer,
+        await client.invoke(
+            pyrogram.raw.functions.messages.EditForumTopic(
+                peer=peer,
                 topic_id=thread_id,
                 title=new_title
             )
         )
-        
+
         logger.info(f"Заголовок треда {thread_id} успешно изменен на '{new_title}'")
         return True
     except Exception as e:
+        # Игнорируем ошибку "TOPIC_NOT_MODIFIED" - заголовок уже такой
+        if "TOPIC_NOT_MODIFIED" in str(e):
+            logger.debug(f"Тред {thread_id}: заголовок уже '{new_title}'")
+            return True
         logger.error(f"Ошибка при изменении заголовка треда: {e}")
         return False
 @business.on_message(filters.command("list_topics") & filters.private)
@@ -2523,6 +2699,48 @@ async def handle_list_threads(client, message):
     except Exception as e:
         logger.error(f"Ошибка при получении списка тредов: {e}")
         await message.reply_text(f"Произошла ошибка при получении списка тредов: {e}")
+
+
+# Команда /del - удалить сообщение у клиента (reply на своё сообщение)
+@business.on_message(filters.command("del") & filters.chat(SUPPORT_GROUP_ID) & filters.reply)
+async def handle_delete_message(client, message):
+    """Удалить сообщение у клиента (менеджер делает reply на своё сообщение и пишет /del)"""
+    try:
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("❌ Вы не авторизованы")
+            return
+
+        reply_to_msg = message.reply_to_message
+        if not reply_to_msg:
+            await message.reply_text("❌ Сделайте reply на сообщение, которое хотите удалить")
+            return
+
+        # Получаем thread_id
+        thread_id = message.message_thread_id
+
+        # Ищем маппинг: group_message_id -> client_message_id
+        mapping = get_client_message_id(db_connection, reply_to_msg.id, thread_id)
+        if not mapping:
+            await message.reply_text("❌ Не найдено соответствующее сообщение у клиента")
+            return
+
+        client_msg_id, client_id = mapping
+
+        # Удаляем сообщение у клиента
+        try:
+            await client.delete_messages(chat_id=client_id, message_ids=client_msg_id)
+            await message.reply_text("✅ Сообщение удалено у клиента")
+            logger.info(f"Менеджер {manager_id} удалил сообщение {client_msg_id} у клиента {client_id}")
+        except Exception as e:
+            await message.reply_text(f"❌ Не удалось удалить сообщение: {e}")
+            logger.error(f"Ошибка при удалении сообщения: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке команды /del: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
 
 # Обработчик команды /ok для сброса текущего уведомления
 @business.on_message(filters.command("ok") & filters.chat(SUPPORT_GROUP_ID))
@@ -2903,6 +3121,123 @@ async def handle_command_buttons(client, callback_query):
     except Exception as e:
         logger.error(f"Ошибка при обработке нажатия кнопки: {e}")
         await callback_query.answer(f"Произошла ошибка: {e}", show_alert=True)
+
+
+# Обработчик редактирования сообщений клиента
+@business.on_edited_message(filters.private)
+async def handle_edited_message(client, message):
+    """Когда клиент редактирует сообщение - уведомляем группу"""
+    try:
+        user = message.from_user
+        if not user:
+            return
+
+        user_id = user.id
+        client_msg_id = message.id
+        new_text = message.text or message.caption or ""
+
+        # Ищем маппинг для этого сообщения
+        mapping = get_group_message_id(db_connection, client_msg_id, user_id)
+        if not mapping:
+            logger.debug(f"Маппинг для сообщения {client_msg_id} от {user_id} не найден")
+            return
+
+        group_msg_id, thread_id, old_text = mapping
+
+        # Формируем имя клиента
+        client_name = user.first_name or ""
+        if user.last_name:
+            client_name += f" {user.last_name}"
+        username_str = f" @{user.username}" if user.username else ""
+
+        # Формируем уведомление (только новый текст, т.к. это reply на оригинал)
+        new_preview = new_text[:200] + "..." if new_text and len(new_text) > 200 else new_text
+        if new_text:
+            notification = f"✏️ **{client_name}{username_str}** изменил на:\n_{escape_markdown(new_preview)}_"
+        else:
+            notification = f"✏️ **{client_name}{username_str}** изменил медиа"
+
+        # Отправляем уведомление в тред как reply на оригинальное сообщение
+        await client.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            text=notification,
+            reply_to_message_id=group_msg_id,
+            parse_mode=pyrogram.enums.ParseMode.MARKDOWN
+        )
+
+        # Обновляем текст в маппинге
+        update_message_text(db_connection, client_msg_id, user_id, new_text)
+
+        logger.info(f"Клиент {user_id} отредактировал сообщение {client_msg_id}, уведомление в тред {thread_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке редактирования сообщения: {e}")
+
+
+# Обработчик удаления сообщений клиента
+@business.on_deleted_messages(filters.private)
+async def handle_deleted_message(client, messages):
+    """Когда клиент удаляет сообщение - уведомляем группу"""
+    try:
+        for message in messages:
+            # message может быть просто ID или объект с ограниченной информацией
+            if hasattr(message, 'id'):
+                client_msg_id = message.id
+                user_id = message.chat.id if hasattr(message, 'chat') and message.chat else None
+            else:
+                client_msg_id = message
+                user_id = None
+
+            if not user_id:
+                # Пробуем найти user_id по message_id в маппинге
+                cursor = db_connection.cursor()
+                cursor.execute('''
+                SELECT user_id, group_message_id, thread_id, message_text FROM message_mapping
+                WHERE client_message_id = ?
+                ORDER BY id DESC LIMIT 1
+                ''', (client_msg_id,))
+                result = cursor.fetchone()
+                if result:
+                    user_id, group_msg_id, thread_id, old_text = result
+                else:
+                    continue
+            else:
+                # Ищем маппинг для этого сообщения
+                mapping = get_group_message_id(db_connection, client_msg_id, user_id)
+                if not mapping:
+                    continue
+                group_msg_id, thread_id, old_text = mapping
+
+            # Получаем информацию о клиенте
+            client_info = get_client_info_by_thread(db_connection, thread_id)
+            if client_info:
+                first_name, last_name, username = client_info
+                client_name = first_name or ""
+                if last_name:
+                    client_name += f" {last_name}"
+                username_str = f" @{username}" if username else ""
+            else:
+                client_name = "Клиент"
+                username_str = ""
+
+            # Формируем уведомление
+            notification = f"🗑 **{client_name}{username_str}** удалил сообщение"
+
+            # Отправляем уведомление как reply на оригинальное сообщение
+            await client.send_message(
+                chat_id=SUPPORT_GROUP_ID,
+                text=notification,
+                reply_to_message_id=group_msg_id,
+                parse_mode=pyrogram.enums.ParseMode.MARKDOWN
+            )
+
+            logger.info(f"Клиент {user_id} удалил сообщение {client_msg_id}, уведомление в тред {thread_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке удаления сообщения: {e}")
+
+
+
 
 # Обработчик всех сообщений в личных чатах (кроме команд)
 @business.on_message(filters.private & ~filters.command(["start", "check_forum", "list_topics", "create_test_topic", "help"]))

@@ -115,6 +115,37 @@ def setup_database():
     )
     ''')
 
+    # Таблица маппинга сообщений (клиент ↔ группа)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS message_mapping (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_message_id INTEGER NOT NULL,
+        group_message_id INTEGER NOT NULL,
+        thread_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        message_text TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
+    # Добавляем колонку message_text в message_mapping, если её нет
+    try:
+        cursor.execute('SELECT message_text FROM message_mapping LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE message_mapping ADD COLUMN message_text TEXT')
+        logger.info("Добавлена колонка message_text в таблицу message_mapping")
+
+    # Индексы для быстрого поиска
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_message_mapping_client
+    ON message_mapping(client_message_id, user_id)
+    ''')
+
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_message_mapping_group
+    ON message_mapping(group_message_id, thread_id)
+    ''')
+
     conn.commit()
     return conn
 
@@ -489,3 +520,59 @@ def get_group_by_thread(conn, thread_id):
     cursor = conn.cursor()
     cursor.execute('SELECT group_id, group_title FROM group_threads WHERE thread_id = ?', (thread_id,))
     return cursor.fetchone()
+
+
+# === Маппинг сообщений ===
+
+def save_message_mapping(conn, client_message_id, group_message_id, thread_id, user_id, message_text=None):
+    """Сохранить связь между сообщением клиента и сообщением в группе"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO message_mapping (client_message_id, group_message_id, thread_id, user_id, message_text)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (client_message_id, group_message_id, thread_id, user_id, message_text))
+    conn.commit()
+
+
+def get_group_message_id(conn, client_message_id, user_id):
+    """Получить ID сообщения в группе по ID сообщения клиента"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT group_message_id, thread_id, message_text FROM message_mapping
+    WHERE client_message_id = ? AND user_id = ?
+    ORDER BY id DESC LIMIT 1
+    ''', (client_message_id, user_id))
+    return cursor.fetchone()
+
+
+def update_message_text(conn, client_message_id, user_id, new_text):
+    """Обновить текст сообщения в маппинге"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE message_mapping SET message_text = ?
+    WHERE client_message_id = ? AND user_id = ?
+    ''', (new_text, client_message_id, user_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_client_message_id(conn, group_message_id, thread_id):
+    """Получить ID сообщения клиента по ID сообщения в группе"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT client_message_id, user_id FROM message_mapping
+    WHERE group_message_id = ? AND thread_id = ?
+    ORDER BY id DESC LIMIT 1
+    ''', (group_message_id, thread_id))
+    return cursor.fetchone()
+
+
+def cleanup_old_mappings(conn, days=30):
+    """Удалить старые маппинги (старше N дней)"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    DELETE FROM message_mapping
+    WHERE created_at < datetime('now', '-' || ? || ' days')
+    ''', (days,))
+    conn.commit()
+    return cursor.rowcount
