@@ -1,4 +1,5 @@
 from pyrogram import Client, filters
+from pyrogram.handlers import RawUpdateHandler
 import pyrogram
 import sqlite3
 import datetime
@@ -363,12 +364,13 @@ async def forward_message_to_support(client, message, thread_id=None):
                 if duty_manager:
                     manager_mention = f"\n—\n@{duty_manager}"
                 
-                # Определяем имя отправителя (короткий формат: Имя @username)
+                # Определяем имя отправителя (формат: Имя → где → ссылка на профиль)
                 user_name = escape_markdown(message.from_user.first_name or "")
                 if message.from_user.last_name:
                     user_name += f" {escape_markdown(message.from_user.last_name)}"
-                if message.from_user.username:
-                    user_name += f" @{message.from_user.username}"
+                # Добавляем стрелку-ссылку на профиль
+                user_id = message.from_user.id
+                user_name += f" [↗](tg://user?id={user_id})"
 
                 # Проверяем, является ли сообщение ответом на другое
                 reply_info = ""
@@ -478,7 +480,7 @@ async def forward_message_to_support(client, message, thread_id=None):
                         message_header = f"**{user_name}** переслал от **{forward_from_name}**:"
                 else:
                     # Обычный формат
-                    message_header = f"**{user_name}:**"
+                    message_header = f"**{user_name}**"
 
                 # Формируем строку с медиа (+ 1 видео, + 2 файла и т.д.)
                 media_info = ""
@@ -491,8 +493,8 @@ async def forward_message_to_support(client, message, thread_id=None):
                     user_name_html = escape_html(message.from_user.first_name or "")
                     if message.from_user.last_name:
                         user_name_html += f" {escape_html(message.from_user.last_name)}"
-                    if message.from_user.username:
-                        user_name_html += f" @{message.from_user.username}"
+                    # Добавляем стрелку-ссылку на профиль (HTML формат)
+                    user_name_html += f' <a href="tg://user?id={user_id}">↗</a>'
 
                     message_content_html = ""
                     if hasattr(message, 'text') and message.text:
@@ -500,7 +502,7 @@ async def forward_message_to_support(client, message, thread_id=None):
                     elif hasattr(message, 'caption') and message.caption:
                         message_content_html = escape_html(message.caption)
 
-                    message_header_html = f"<b>{user_name_html}:</b>"
+                    message_header_html = f"<b>{user_name_html}</b>"
                     media_info_html = f"\n+ {media_count} {media_label}" if media_type else ""
 
                     if message_content_html:
@@ -892,8 +894,9 @@ async def handle_client_media_group(client, message, thread_id=None):
                         user_name = escape_markdown(message.from_user.first_name or "")
                         if message.from_user.last_name:
                             user_name += f" {escape_markdown(message.from_user.last_name)}"
-                        if message.from_user.username:
-                            user_name += f" @{message.from_user.username}"
+                        # Добавляем стрелку-ссылку на профиль
+                        user_id = message.from_user.id
+                        user_name += f" [↗](tg://user?id={user_id})"
 
                         # Проверяем, пересланы ли файлы (используем новый API forward_origin)
                         first_msg = group_data["messages"][0]
@@ -920,7 +923,7 @@ async def handle_client_media_group(client, message, thread_id=None):
                             else:
                                 header = f"**{user_name}** переслал от **{forward_from_name}**:"
                         else:
-                            header = f"**{user_name}**:"
+                            header = f"**{user_name}**"
 
                         # Собираем: заголовок + текст (если есть) + счётчик файлов
                         if caption_text:
@@ -1601,14 +1604,13 @@ async def handle_group_messages(client, message):
                     is_mentioned = True
                     break
         
-        # Получаем имя отправителя
+        # Получаем имя отправителя (формат: Имя → где → ссылка на профиль)
         user = message.from_user
         user_name = f"{user.first_name or ''}"
         if user.last_name:
             user_name += f" {user.last_name}"
-        if user.username:
-            user_name += f" (@{user.username})"
-        
+        user_name += f" [↗](tg://user?id={user.id})"
+
         # Получаем ответственного менеджера для треда
         duty_manager = get_duty_manager(db_connection, thread_id)
             
@@ -2558,6 +2560,99 @@ async def handle_set_custom_id(client, message):
         logger.error(f"Ошибка при работе с Custom ID: {e}")
         await message.reply_text(f"Ошибка: {e}")
 
+
+@business.on_message(filters.command("company") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_set_company(client, message):
+    """Установить название компании для клиента.
+    Использование: /company [thread_id] [Название компании]"""
+    try:
+        if not message.from_user:
+            await message.reply_text("❌ Невозможно определить отправителя.")
+            return
+
+        manager_id = message.from_user.id
+
+        # Проверяем авторизацию
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы. Используйте /auth")
+            return
+
+        # Парсим команду: /company [thread_id] [Название компании]
+        command_parts = message.text.split(maxsplit=2)
+
+        if len(command_parts) < 2:
+            await message.reply_text(
+                "**Использование:**\n"
+                "`/company [thread_id]` - показать компанию\n"
+                "`/company [thread_id] [Название]` - установить компанию\n\n"
+                "**Пример:** `/company 4 ООО Ромашка`"
+            )
+            return
+
+        # Получаем thread_id
+        try:
+            thread_id = int(command_parts[1])
+        except ValueError:
+            await message.reply_text("❌ thread_id должен быть числом")
+            return
+
+        # Получаем клиента по thread_id
+        client_data = get_client_by_thread(db_connection, thread_id)
+        if not client_data:
+            await message.reply_text(f"❌ Клиент не найден для треда #{thread_id}")
+            return
+
+        first_name = client_data[1] or ""
+        last_name = client_data[2] or ""
+        client_name = f"{first_name} {last_name}".strip()
+
+        if len(command_parts) >= 3:
+            # Устанавливаем название компании
+            company_name = command_parts[2].strip()
+
+            from database import set_company_name
+            success = set_company_name(db_connection, thread_id, company_name)
+
+            if success:
+                # Обновляем заголовок треда: "№: Имя | Компания"
+                new_title = f"{thread_id}: {client_name} | {company_name}"
+                await edit_thread_title(client, thread_id, new_title)
+
+                await message.reply_text(
+                    f"✅ **Компания установлена:** {company_name}\n"
+                    f"**Клиент:** {client_name}\n"
+                    f"**Thread:** {thread_id}\n\n"
+                    f"Заголовок треда обновлён"
+                )
+                logger.info(f"Менеджер {manager_id} установил компанию '{company_name}' для треда {thread_id}")
+            else:
+                await message.reply_text(f"❌ Не удалось установить компанию для треда {thread_id}")
+        else:
+            # Показываем текущую компанию
+            from database import get_company_name
+            current_company = get_company_name(db_connection, thread_id)
+
+            if current_company:
+                await message.reply_text(
+                    f"**Компания:** {current_company}\n"
+                    f"**Клиент:** {client_name}\n"
+                    f"**Thread:** {thread_id}\n\n"
+                    f"Изменить: `/company {thread_id} НоваяКомпания`"
+                )
+            else:
+                await message.reply_text(
+                    f"**Клиент:** {client_name}\n"
+                    f"**Thread:** {thread_id}\n\n"
+                    f"❌ Компания не установлена\n"
+                    f"Задать: `/company {thread_id} Название компании`"
+                )
+
+    except Exception as e:
+        logger.error(f"Ошибка при работе с компанией: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
 # Функция для изменения заголовка треда
 async def edit_thread_title(client, thread_id, new_title):
     try:
@@ -3051,7 +3146,7 @@ async def handle_help_command(client, message):
 - `/[thread_id] [текст]` - Ответить по номеру треда
 - `/[ИмяКлиента] [текст]` - Ответить по ID клиента (русские буквы)
 - `/id [thread_id] [Имя]` - Задать ID клиенту
-- `/id [thread_id]` - Показать ID клиента
+- `/company [thread_id] [Компания]` - Задать название компании
 - `/card [thread_id]` - Отправить визитку клиенту
 
 ⚙️ **Управление**:
@@ -3508,15 +3603,132 @@ async def handle_setup_commands(client, message):
         logger.error(f"Ошибка при настройке команд: {e}")
         await message.reply_text(f"❌ Ошибка при настройке команд: {e}")
 
+# Обработчик реакций от клиентов через raw updates
+async def handle_client_reactions(client, update, users, chats):
+    """Обработчик raw updates для отслеживания реакций клиентов"""
+    try:
+        update_type = type(update).__name__
+
+        # Логируем только реакции
+        if "Reaction" in update_type:
+            logger.info(f"=== CLIENT REACTION === {update_type}")
+
+            # UpdateBotMessageReaction или UpdateMessageReactions
+            if hasattr(update, 'reactions') or hasattr(update, 'new_reactions'):
+                msg_id = getattr(update, 'msg_id', None)
+                peer = getattr(update, 'peer', None)
+
+                # Получаем реакции
+                reactions = getattr(update, 'reactions', None) or getattr(update, 'new_reactions', [])
+
+                if reactions:
+                    # Форматируем реакции
+                    emoji_list = []
+                    for r in reactions:
+                        if hasattr(r, 'reaction'):
+                            reaction = r.reaction
+                            if hasattr(reaction, 'emoticon'):
+                                emoji_list.append(reaction.emoticon)
+                        elif hasattr(r, 'emoticon'):
+                            emoji_list.append(r.emoticon)
+
+                    if emoji_list:
+                        emoji_str = " ".join(emoji_list)
+                        logger.info(f"Реакции на сообщение {msg_id}: {emoji_str}")
+
+                        # Отправляем уведомление в группу
+                        try:
+                            # Определяем thread_id из peer если возможно
+                            notification = f"👍 Клиент поставил реакцию: {emoji_str}"
+
+                            # Попробуем найти thread_id по сообщению (если есть маппинг)
+                            # Пока просто логируем
+                            logger.info(notification)
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки уведомления о реакции: {e}")
+
+    except Exception as e:
+        logger.debug(f"Ошибка обработки raw update: {e}")
+
+
+# Обработчик реакций через on_message_reaction_updated
+@business.on_message_reaction_updated()
+async def on_client_reaction(client, update):
+    """Обработчик реакций клиентов на сообщения"""
+    try:
+        logger.info(f"=== REACTION UPDATE === {update}")
+
+        chat = update.chat
+        user = getattr(update, 'user', None) or getattr(update, 'actor', None)
+        old_reaction = update.old_reaction
+        new_reaction = update.new_reaction
+
+        # Получаем имя пользователя
+        user_name = "Клиент"
+        user_link = ""
+        if user:
+            user_name = user.first_name or ""
+            if user.last_name:
+                user_name += f" {user.last_name}"
+            user_link = f" [↗](tg://user?id={user.id})"
+
+        # Определяем добавленные реакции
+        new_emojis = set()
+        if new_reaction:
+            for r in new_reaction:
+                if hasattr(r, 'emoji') and r.emoji:
+                    new_emojis.add(r.emoji)
+
+        old_emojis = set()
+        if old_reaction:
+            for r in old_reaction:
+                if hasattr(r, 'emoji') and r.emoji:
+                    old_emojis.add(r.emoji)
+
+        added = new_emojis - old_emojis
+
+        if added:
+            emoji_str = " ".join(added)
+            notification = f"👍 **{user_name}{user_link}** поставил реакцию: {emoji_str}"
+            logger.info(notification)
+
+            # Если это личный чат (business), отправляем уведомление в группу
+            if chat and chat.type in [pyrogram.enums.ChatType.PRIVATE]:
+                # Ищем thread_id клиента
+                client_data = get_client_by_thread(db_connection, None)  # TODO: найти по user_id
+                cursor = db_connection.cursor()
+                cursor.execute('SELECT thread_id FROM clients WHERE user_id = ?', (user.id if user else 0,))
+                result = cursor.fetchone()
+
+                if result and result[0]:
+                    thread_id = result[0]
+                    try:
+                        await client.send_message(
+                            chat_id=SUPPORT_GROUP_ID,
+                            text=notification,
+                            reply_to_message_id=thread_id,
+                            parse_mode=pyrogram.enums.ParseMode.MARKDOWN
+                        )
+                        logger.info(f"Уведомление о реакции отправлено в тред {thread_id}")
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки уведомления о реакции: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки реакции клиента: {e}")
+
+
 # Запускаем клиент
 if __name__ == "__main__":
     try:
         logger.info("Запуск бизнес-аккаунта Telegram...")
         logger.info(f"База данных клиентов настроена. Группа поддержки: {SUPPORT_GROUP_ID}")
-        
+
+        # Добавляем raw handler для реакций
+        business.add_handler(RawUpdateHandler(handle_client_reactions), group=-1)
+
         # Запускаем периодическую проверку неотвеченных сообщений
         business.loop.create_task(schedule_checks())
-        
+
         business.run()
     except Exception as e:
         logger.error(f"Критическая ошибка при запуске: {e}")

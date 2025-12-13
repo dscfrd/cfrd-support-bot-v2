@@ -38,6 +38,13 @@ def setup_database():
         cursor.execute('ALTER TABLE clients ADD COLUMN custom_id TEXT DEFAULT NULL')
         logger.info("Добавлена колонка custom_id в таблицу clients")
 
+    # Добавляем колонку company_name, если её нет
+    try:
+        cursor.execute('SELECT company_name FROM clients LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE clients ADD COLUMN company_name TEXT DEFAULT NULL')
+        logger.info("Добавлена колонка company_name в таблицу clients")
+
     # Таблица сообщений
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS messages (
@@ -373,6 +380,31 @@ def get_custom_id_by_thread(conn, thread_id):
     cursor.execute('SELECT custom_id FROM clients WHERE thread_id = ?', (thread_id,))
     result = cursor.fetchone()
     return result[0] if result else None
+
+
+# === Название компании ===
+
+def set_company_name(conn, thread_id, company_name):
+    """Установить название компании для клиента по thread_id"""
+    cursor = conn.cursor()
+    cursor.execute('UPDATE clients SET company_name = ? WHERE thread_id = ?', (company_name, thread_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_company_name(conn, thread_id):
+    """Получить название компании по thread_id"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT company_name FROM clients WHERE thread_id = ?', (thread_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def get_client_info_for_thread_title(conn, thread_id):
+    """Получить информацию о клиенте для заголовка треда: (first_name, last_name, company_name)"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT first_name, last_name, company_name FROM clients WHERE thread_id = ?', (thread_id,))
+    return cursor.fetchone()
 
 
 # === Ответственные менеджеры ===
