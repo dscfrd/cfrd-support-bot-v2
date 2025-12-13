@@ -45,6 +45,13 @@ def setup_database():
         cursor.execute('ALTER TABLE clients ADD COLUMN company_name TEXT DEFAULT NULL')
         logger.info("Добавлена колонка company_name в таблицу clients")
 
+    # Добавляем колонку tier (тир клиента: 1, 2, 3), если её нет
+    try:
+        cursor.execute('SELECT tier FROM clients LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE clients ADD COLUMN tier INTEGER DEFAULT NULL')
+        logger.info("Добавлена колонка tier в таблицу clients")
+
     # Таблица сообщений
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS messages (
@@ -141,6 +148,18 @@ def setup_database():
     except sqlite3.OperationalError:
         cursor.execute('ALTER TABLE message_mapping ADD COLUMN message_text TEXT')
         logger.info("Добавлена колонка message_text в таблицу message_mapping")
+
+    # Таблица замещений менеджеров (отпуск/больничный)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS manager_substitutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_manager TEXT NOT NULL,
+        substitute_manager TEXT NOT NULL,
+        thread_id INTEGER NOT NULL,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(original_manager, thread_id)
+    )
+    ''')
 
     # Индексы для быстрого поиска
     cursor.execute('''
@@ -699,3 +718,148 @@ def get_manager_by_username(conn, username):
     clean_username = username.lstrip('@')
     cursor.execute('SELECT manager_id, name, username FROM managers WHERE username = ?', (clean_username,))
     return cursor.fetchone()
+
+
+# === Тиры клиентов ===
+
+def set_client_tier(conn, thread_id, tier):
+    """Установить тир клиента (1, 2, 3 или None для сброса)"""
+    cursor = conn.cursor()
+    if tier is not None and tier not in (1, 2, 3):
+        return False, "Тир должен быть 1, 2 или 3"
+    cursor.execute('UPDATE clients SET tier = ? WHERE thread_id = ?', (tier, thread_id))
+    conn.commit()
+    return cursor.rowcount > 0, None
+
+
+def get_client_tier(conn, thread_id):
+    """Получить тир клиента"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT tier FROM clients WHERE thread_id = ?', (thread_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def get_threads_by_tier(conn, manager_username, tiers=None):
+    """Получить треды менеджера, опционально фильтруя по тирам"""
+    cursor = conn.cursor()
+    if tiers:
+        placeholders = ','.join('?' * len(tiers))
+        cursor.execute(f'''
+        SELECT dm.thread_id, c.first_name, c.last_name, c.tier
+        FROM duty_managers dm
+        LEFT JOIN clients c ON dm.thread_id = c.thread_id
+        WHERE dm.manager_username = ? AND c.tier IN ({placeholders})
+        ''', (manager_username, *tiers))
+    else:
+        cursor.execute('''
+        SELECT dm.thread_id, c.first_name, c.last_name, c.tier
+        FROM duty_managers dm
+        LEFT JOIN clients c ON dm.thread_id = c.thread_id
+        WHERE dm.manager_username = ?
+        ''', (manager_username,))
+    return cursor.fetchall()
+
+
+# === Замещения менеджеров (отпуск/больничный) ===
+
+def start_vacation(conn, original_manager, substitute_manager, assigned_by, tiers=None):
+    """
+    Начать замещение - передать треды заместителю.
+    Возвращает количество переданных тредов.
+    """
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    # Получаем треды оригинального менеджера (с фильтром по тирам если указаны)
+    if tiers:
+        placeholders = ','.join('?' * len(tiers))
+        cursor.execute(f'''
+        SELECT dm.thread_id FROM duty_managers dm
+        LEFT JOIN clients c ON dm.thread_id = c.thread_id
+        WHERE dm.manager_username = ? AND c.tier IN ({placeholders})
+        ''', (original_manager, *tiers))
+    else:
+        cursor.execute('SELECT thread_id FROM duty_managers WHERE manager_username = ?', (original_manager,))
+
+    threads = cursor.fetchall()
+    if not threads:
+        return 0
+
+    count = 0
+    for (thread_id,) in threads:
+        # Сохраняем информацию о замещении
+        try:
+            cursor.execute('''
+            INSERT OR REPLACE INTO manager_substitutions (original_manager, substitute_manager, thread_id, started_at)
+            VALUES (?, ?, ?, ?)
+            ''', (original_manager, substitute_manager, thread_id, current_time))
+
+            # Переназначаем тред заместителю
+            cursor.execute('''
+            UPDATE duty_managers SET manager_username = ?, assigned_by = ?, assigned_at = ?
+            WHERE thread_id = ?
+            ''', (substitute_manager, assigned_by, current_time, thread_id))
+            count += 1
+        except Exception as e:
+            logger.error(f"Ошибка при замещении треда {thread_id}: {e}")
+
+    conn.commit()
+    return count
+
+
+def end_vacation(conn, original_manager, assigned_by):
+    """
+    Завершить замещение - вернуть треды оригинальному менеджеру.
+    Возвращает количество возвращённых тредов.
+    """
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    # Получаем все замещения для этого менеджера
+    cursor.execute('''
+    SELECT thread_id, substitute_manager FROM manager_substitutions
+    WHERE original_manager = ?
+    ''', (original_manager,))
+
+    substitutions = cursor.fetchall()
+    if not substitutions:
+        return 0
+
+    count = 0
+    for thread_id, substitute_manager in substitutions:
+        # Проверяем, что тред всё ещё у заместителя (не был переназначен кому-то другому)
+        cursor.execute('SELECT manager_username FROM duty_managers WHERE thread_id = ?', (thread_id,))
+        current = cursor.fetchone()
+
+        if current and current[0] == substitute_manager:
+            # Возвращаем тред оригинальному менеджеру
+            cursor.execute('''
+            UPDATE duty_managers SET manager_username = ?, assigned_by = ?, assigned_at = ?
+            WHERE thread_id = ?
+            ''', (original_manager, assigned_by, current_time, thread_id))
+            count += 1
+
+    # Удаляем записи о замещении
+    cursor.execute('DELETE FROM manager_substitutions WHERE original_manager = ?', (original_manager,))
+    conn.commit()
+    return count
+
+
+def get_vacation_info(conn, manager_username):
+    """Получить информацию о замещении менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT substitute_manager, COUNT(*) as thread_count, MIN(started_at) as started
+    FROM manager_substitutions
+    WHERE original_manager = ?
+    GROUP BY substitute_manager
+    ''', (manager_username,))
+    return cursor.fetchall()
+
+
+def is_on_vacation(conn, manager_username):
+    """Проверить, находится ли менеджер в отпуске"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM manager_substitutions WHERE original_manager = ?', (manager_username,))
+    return cursor.fetchone()[0] > 0

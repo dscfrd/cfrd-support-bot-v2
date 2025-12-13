@@ -3054,12 +3054,12 @@ async def handle_duties_command(client, message):
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
-# Команда /reassign - переназначить все треды от одного менеджера другому
-@business.on_message(filters.command("reassign") & filters.chat(SUPPORT_GROUP_ID))
-async def handle_reassign_command(client, message):
+# Команда /tier - установить тир клиента
+@business.on_message(filters.command("tier") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_tier_command(client, message):
     """
-    Переназначить все треды от одного менеджера другому.
-    Использование: /reassign @старый_менеджер @новый_менеджер
+    Установить тир клиента (tier-1, tier-2, tier-3).
+    Использование: /tier [thread_id] [1|2|3]
     """
     try:
         # Проверяем, авторизован ли менеджер
@@ -3075,145 +3075,343 @@ async def handle_reassign_command(client, message):
         args = message.text.split()[1:]
         if len(args) < 2:
             await message.reply_text(
-                "**Использование:** `/reassign @старый @новый`\n\n"
-                "Переназначает все треды от одного менеджера другому.\n"
-                "Пример: `/reassign @ivan @petr`"
+                "**Использование:** `/tier [ID_треда] [1|2|3]`\n\n"
+                "Устанавливает тир клиента:\n"
+                "• tier-1 - базовый\n"
+                "• tier-2 - средний\n"
+                "• tier-3 - премиум\n\n"
+                "Пример: `/tier 123 2`"
             )
             return
 
-        old_username = args[0].lstrip('@')
-        new_username = args[1].lstrip('@')
-
-        if old_username == new_username:
-            await message.reply_text("Нельзя переназначить менеджеру самому себе.")
+        try:
+            thread_id = int(args[0])
+            tier = int(args[1])
+        except ValueError:
+            await message.reply_text("ID треда и тир должны быть числами.")
             return
 
-        # Проверяем, существует ли старый менеджер в назначениях
-        from database import get_manager_threads, reassign_all_threads
-        old_threads = get_manager_threads(db_connection, old_username)
-        if not old_threads:
-            await message.reply_text(f"У @{old_username} нет назначенных тредов.")
+        if tier not in (1, 2, 3):
+            await message.reply_text("Тир должен быть 1, 2 или 3.")
             return
 
-        # Переназначаем треды
-        count = reassign_all_threads(db_connection, old_username, new_username, manager_id)
-
-        await message.reply_text(
-            f"✅ Переназначено **{count}** тредов от @{old_username} к @{new_username}"
-        )
-        logger.info(f"Менеджер {manager_id} переназначил {count} тредов от @{old_username} к @{new_username}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при переназначении тредов: {e}")
-        await message.reply_text(f"Произошла ошибка: {e}")
-
-
-# Команда /unassign - снять ответственность со всех тредов менеджера
-@business.on_message(filters.command("unassign") & filters.chat(SUPPORT_GROUP_ID))
-async def handle_unassign_command(client, message):
-    """
-    Снять ответственность менеджера со всех его тредов.
-    Использование: /unassign @менеджер
-    """
-    try:
-        # Проверяем, авторизован ли менеджер
-        manager_id = message.from_user.id
-        manager = get_manager(db_connection, manager_id)
-        if not manager:
-            await message.reply_text(
-                "Вы не авторизованы в системе. Используйте /auth для авторизации."
-            )
+        from database import set_client_tier, get_client_by_thread
+        client_info = get_client_by_thread(db_connection, thread_id)
+        if not client_info:
+            await message.reply_text(f"Клиент с тредом {thread_id} не найден.")
             return
 
-        # Парсим аргументы
-        args = message.text.split()[1:]
-        if len(args) < 1:
-            await message.reply_text(
-                "**Использование:** `/unassign @менеджер`\n\n"
-                "Снимает ответственность менеджера со всех его тредов.\n"
-                "Пример: `/unassign @ivan`"
-            )
-            return
-
-        target_username = args[0].lstrip('@')
-
-        # Получаем список тредов до снятия
-        from database import get_manager_threads, unassign_all_threads
-        threads = get_manager_threads(db_connection, target_username)
-
-        if not threads:
-            await message.reply_text(f"У @{target_username} нет назначенных тредов.")
-            return
-
-        # Снимаем ответственность
-        count = unassign_all_threads(db_connection, target_username)
-
-        await message.reply_text(
-            f"✅ Снята ответственность @{target_username} с **{count}** тредов.\n"
-            f"Теперь эти треды без ответственного менеджера."
-        )
-        logger.info(f"Менеджер {manager_id} снял ответственность @{target_username} с {count} тредов")
-
-    except Exception as e:
-        logger.error(f"Ошибка при снятии ответственности: {e}")
-        await message.reply_text(f"Произошла ошибка: {e}")
-
-
-# Команда /remove_manager - удалить менеджера из системы
-@business.on_message(filters.command("remove_manager") & filters.chat(SUPPORT_GROUP_ID))
-async def handle_remove_manager_command(client, message):
-    """
-    Полностью удалить менеджера из системы.
-    Использование: /remove_manager @менеджер
-    """
-    try:
-        # Проверяем, авторизован ли менеджер
-        manager_id = message.from_user.id
-        manager = get_manager(db_connection, manager_id)
-        if not manager:
-            await message.reply_text(
-                "Вы не авторизованы в системе. Используйте /auth для авторизации."
-            )
-            return
-
-        # Парсим аргументы
-        args = message.text.split()[1:]
-        if len(args) < 1:
-            await message.reply_text(
-                "**Использование:** `/remove_manager @менеджер`\n\n"
-                "Удаляет менеджера из системы полностью:\n"
-                "• Снимает со всех тредов\n"
-                "• Удаляет из базы данных\n\n"
-                "Пример: `/remove_manager @ivan`"
-            )
-            return
-
-        target_username = args[0].lstrip('@')
-
-        # Проверяем, существует ли менеджер
-        from database import get_manager_by_username, remove_manager as db_remove_manager
-        manager_info = get_manager_by_username(db_connection, target_username)
-
-        if not manager_info:
-            await message.reply_text(f"Менеджер @{target_username} не найден в системе.")
-            return
-
-        manager_name = manager_info[1] or target_username
-
-        # Удаляем менеджера
-        success, threads_count = db_remove_manager(db_connection, target_username)
-
+        success, error = set_client_tier(db_connection, thread_id, tier)
         if success:
-            await message.reply_text(
-                f"✅ Менеджер **{manager_name}** (@{target_username}) удалён из системы.\n"
-                f"Снят с **{threads_count}** тредов."
-            )
-            logger.info(f"Менеджер {manager_id} удалил @{target_username} из системы (снят с {threads_count} тредов)")
+            client_name = client_info[1] or "Клиент"
+            await message.reply_text(f"✅ Клиенту **{client_name}** (тред {thread_id}) установлен **tier-{tier}**")
+            logger.info(f"Менеджер {manager_id} установил tier-{tier} для треда {thread_id}")
         else:
-            await message.reply_text(f"Не удалось удалить менеджера @{target_username}.")
+            await message.reply_text(f"Ошибка: {error}")
 
     except Exception as e:
-        logger.error(f"Ошибка при удалении менеджера: {e}")
+        logger.error(f"Ошибка при установке тира: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /vacation - отправить менеджера в отпуск/на больничный
+@business.on_message(filters.command("vacation") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_vacation_command(client, message):
+    """
+    Отправить менеджера в отпуск - передать его треды заместителю.
+    Использование: /vacation @менеджер @заместитель [tier-1 tier-2 tier-3]
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 2:
+            await message.reply_text(
+                "**Использование:** `/vacation @менеджер @заместитель [тиры]`\n\n"
+                "Передаёт треды менеджера заместителю на время отпуска/больничного.\n\n"
+                "**Опционально:** укажите тиры для частичной передачи:\n"
+                "`/vacation @ivan @petr tier-1 tier-2`\n\n"
+                "Для возврата используйте `/return @менеджер`"
+            )
+            return
+
+        original_username = args[0].lstrip('@')
+        substitute_username = args[1].lstrip('@')
+
+        if original_username == substitute_username:
+            await message.reply_text("Менеджер не может замещать сам себя.")
+            return
+
+        # Парсим тиры если указаны
+        tiers = None
+        if len(args) > 2:
+            tiers = []
+            for arg in args[2:]:
+                arg_lower = arg.lower().replace('tier-', '').replace('tier', '')
+                try:
+                    tier = int(arg_lower)
+                    if tier in (1, 2, 3):
+                        tiers.append(tier)
+                except ValueError:
+                    pass
+            if not tiers:
+                tiers = None
+
+        # Проверяем, не в отпуске ли уже менеджер
+        from database import is_on_vacation, start_vacation, get_manager_threads
+        if is_on_vacation(db_connection, original_username):
+            await message.reply_text(
+                f"@{original_username} уже в отпуске. "
+                f"Сначала верните его командой `/return @{original_username}`"
+            )
+            return
+
+        # Проверяем, есть ли треды у менеджера
+        threads = get_manager_threads(db_connection, original_username)
+        if not threads:
+            await message.reply_text(f"У @{original_username} нет назначенных тредов.")
+            return
+
+        # Начинаем замещение
+        count = start_vacation(db_connection, original_username, substitute_username, manager_id, tiers)
+
+        tier_info = ""
+        if tiers:
+            tier_info = f" (тиры: {', '.join(f'tier-{t}' for t in tiers)})"
+
+        await message.reply_text(
+            f"🏖 **@{original_username}** в отпуске!\n\n"
+            f"Передано **{count}** тредов{tier_info} → @{substitute_username}\n\n"
+            f"Для возврата: `/return @{original_username}`"
+        )
+        logger.info(f"Менеджер {manager_id} отправил @{original_username} в отпуск, {count} тредов → @{substitute_username}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке в отпуск: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /return - вернуть менеджера из отпуска
+@business.on_message(filters.command("return") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_return_command(client, message):
+    """
+    Вернуть менеджера из отпуска - вернуть ему его треды.
+    Использование: /return @менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 1:
+            await message.reply_text(
+                "**Использование:** `/return @менеджер`\n\n"
+                "Возвращает менеджера из отпуска и отдаёт ему его треды.\n"
+                "Примечание: треды, которые были переназначены другим менеджерам, не возвращаются."
+            )
+            return
+
+        target_username = args[0].lstrip('@')
+
+        # Проверяем, в отпуске ли менеджер
+        from database import is_on_vacation, end_vacation, get_vacation_info
+        if not is_on_vacation(db_connection, target_username):
+            await message.reply_text(f"@{target_username} не в отпуске.")
+            return
+
+        # Получаем информацию о замещении для отчёта
+        vacation_info = get_vacation_info(db_connection, target_username)
+
+        # Завершаем замещение
+        count = end_vacation(db_connection, target_username, manager_id)
+
+        await message.reply_text(
+            f"✅ **@{target_username}** вернулся!\n\n"
+            f"Возвращено **{count}** тредов."
+        )
+        logger.info(f"Менеджер {manager_id} вернул @{target_username} из отпуска, возвращено {count} тредов")
+
+    except Exception as e:
+        logger.error(f"Ошибка при возврате из отпуска: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /team - показать карточки всех менеджеров
+@business.on_message(filters.command("team") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_team_command(client, message):
+    """
+    Показать карточки всех менеджеров.
+    Для увольнения: reply на карточку + /fire @новый_менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Получаем всех менеджеров
+        from database import get_all_managers, get_manager_threads, is_on_vacation
+        managers = get_all_managers(db_connection)
+
+        if not managers:
+            await message.reply_text("Нет зарегистрированных менеджеров.")
+            return
+
+        await message.reply_text(
+            f"👥 **Команда менеджеров** ({len(managers)})\n\n"
+            "Для увольнения: reply на карточку + `/fire @новый_менеджер`"
+        )
+
+        # Отправляем карточку каждого менеджера
+        for mgr in managers:
+            mgr_id, username, name = mgr
+            threads = get_manager_threads(db_connection, username) if username else []
+            on_vacation = is_on_vacation(db_connection, username) if username else False
+
+            status = "🏖 В отпуске" if on_vacation else "✅ Активен"
+            username_str = f"@{username}" if username else "без username"
+
+            card_text = (
+                f"**{name or 'Без имени'}**\n"
+                f"ID: `{mgr_id}`\n"
+                f"Username: {username_str}\n"
+                f"Тредов: {len(threads)}\n"
+                f"Статус: {status}"
+            )
+
+            await client.send_message(
+                chat_id=message.chat.id,
+                text=card_text,
+                message_thread_id=message.message_thread_id
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка при показе команды: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /fire - уволить менеджера (reply на карточку из /team)
+@business.on_message(filters.command("fire") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_fire_command(client, message):
+    """
+    Уволить менеджера - передать треды и удалить из группы.
+    Использование: reply на карточку менеджера + /fire @новый_менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Проверяем, что это reply на сообщение
+        if not message.reply_to_message:
+            await message.reply_text(
+                "**Использование:**\n"
+                "1. Вызовите `/team` для просмотра карточек менеджеров\n"
+                "2. Сделайте reply на карточку увольняемого\n"
+                "3. Напишите `/fire @новый_менеджер`\n\n"
+                "Треды увольняемого будут переданы новому менеджеру."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 1:
+            await message.reply_text(
+                "Укажите менеджера для передачи тредов: `/fire @новый_менеджер`"
+            )
+            return
+
+        new_manager_username = args[0].lstrip('@')
+
+        # Извлекаем ID менеджера из карточки
+        reply_text = message.reply_to_message.text or ""
+        import re
+        id_match = re.search(r'ID:\s*`?(\d+)`?', reply_text)
+
+        if not id_match:
+            await message.reply_text(
+                "Не удалось определить менеджера из карточки.\n"
+                "Используйте `/team` и сделайте reply на карточку менеджера."
+            )
+            return
+
+        fired_manager_id = int(id_match.group(1))
+
+        # Получаем данные увольняемого менеджера
+        fired_manager = get_manager(db_connection, fired_manager_id)
+        if not fired_manager:
+            await message.reply_text("Менеджер не найден в системе.")
+            return
+
+        # fired_manager: (manager_id, emoji, name, position, extension, photo_file_id, auth_date, username)
+        fired_username = fired_manager[7] if len(fired_manager) > 7 else None
+        fired_name = fired_manager[2] or "Менеджер"
+
+        if not fired_username:
+            await message.reply_text("У увольняемого менеджера нет username.")
+            return
+
+        if fired_username == new_manager_username:
+            await message.reply_text("Нельзя передать треды самому себе.")
+            return
+
+        # Переназначаем все треды
+        from database import reassign_all_threads, remove_manager as db_remove_manager
+        threads_count = reassign_all_threads(db_connection, fired_username, new_manager_username, manager_id)
+
+        # Удаляем менеджера из системы
+        success, _ = db_remove_manager(db_connection, fired_username)
+
+        # Пытаемся удалить из группы
+        kick_result = ""
+        try:
+            await client.ban_chat_member(
+                chat_id=SUPPORT_GROUP_ID,
+                user_id=fired_manager_id
+            )
+            # Сразу разбаним, чтобы мог вернуться если нужно
+            await client.unban_chat_member(
+                chat_id=SUPPORT_GROUP_ID,
+                user_id=fired_manager_id
+            )
+            kick_result = "\n🚪 Удалён из группы"
+        except Exception as kick_error:
+            logger.warning(f"Не удалось удалить из группы: {kick_error}")
+            kick_result = "\n⚠️ Не удалось удалить из группы (нет прав)"
+
+        await message.reply_text(
+            f"🔥 **{fired_name}** (@{fired_username}) уволен!\n\n"
+            f"Передано **{threads_count}** тредов → @{new_manager_username}\n"
+            f"Удалён из базы данных{kick_result}"
+        )
+        logger.info(f"Менеджер {manager_id} уволил @{fired_username}, {threads_count} тредов → @{new_manager_username}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при увольнении менеджера: {e}")
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
@@ -3319,9 +3517,13 @@ async def handle_help_command(client, message):
 - `/ok [ID_треда]` - Сбросить уведомления для треда
 - `/duties` - Список ответственных менеджеров
 - `/threads` - Список активных тредов
-- `/reassign @старый @новый` - Переназначить все треды
-- `/unassign @менеджер` - Снять ответственность со всех тредов
-- `/remove_manager @менеджер` - Удалить менеджера из системы
+- `/tier [ID_треда] [1|2|3]` - Установить тир клиента
+
+👥 **Менеджеры**:
+- `/vacation @менеджер @заместитель [tier-1 tier-2]` - Отпуск/больничный
+- `/return @менеджер` - Вернуть из отпуска
+- `/team` - Карточки всех менеджеров
+- `/fire @новый` (reply на карточку) - Уволить менеджера
 
 📊 **Информация**:
 - `/myinfo` - Ваша информация в системе
