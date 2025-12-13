@@ -3052,7 +3052,171 @@ async def handle_duties_command(client, message):
     except Exception as e:
         logger.error(f"Ошибка при получении списка ответственных: {e}")
         await message.reply_text(f"Произошла ошибка: {e}")
-              
+
+
+# Команда /reassign - переназначить все треды от одного менеджера другому
+@business.on_message(filters.command("reassign") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_reassign_command(client, message):
+    """
+    Переназначить все треды от одного менеджера другому.
+    Использование: /reassign @старый_менеджер @новый_менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 2:
+            await message.reply_text(
+                "**Использование:** `/reassign @старый @новый`\n\n"
+                "Переназначает все треды от одного менеджера другому.\n"
+                "Пример: `/reassign @ivan @petr`"
+            )
+            return
+
+        old_username = args[0].lstrip('@')
+        new_username = args[1].lstrip('@')
+
+        if old_username == new_username:
+            await message.reply_text("Нельзя переназначить менеджеру самому себе.")
+            return
+
+        # Проверяем, существует ли старый менеджер в назначениях
+        from database import get_manager_threads, reassign_all_threads
+        old_threads = get_manager_threads(db_connection, old_username)
+        if not old_threads:
+            await message.reply_text(f"У @{old_username} нет назначенных тредов.")
+            return
+
+        # Переназначаем треды
+        count = reassign_all_threads(db_connection, old_username, new_username, manager_id)
+
+        await message.reply_text(
+            f"✅ Переназначено **{count}** тредов от @{old_username} к @{new_username}"
+        )
+        logger.info(f"Менеджер {manager_id} переназначил {count} тредов от @{old_username} к @{new_username}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при переназначении тредов: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /unassign - снять ответственность со всех тредов менеджера
+@business.on_message(filters.command("unassign") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_unassign_command(client, message):
+    """
+    Снять ответственность менеджера со всех его тредов.
+    Использование: /unassign @менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 1:
+            await message.reply_text(
+                "**Использование:** `/unassign @менеджер`\n\n"
+                "Снимает ответственность менеджера со всех его тредов.\n"
+                "Пример: `/unassign @ivan`"
+            )
+            return
+
+        target_username = args[0].lstrip('@')
+
+        # Получаем список тредов до снятия
+        from database import get_manager_threads, unassign_all_threads
+        threads = get_manager_threads(db_connection, target_username)
+
+        if not threads:
+            await message.reply_text(f"У @{target_username} нет назначенных тредов.")
+            return
+
+        # Снимаем ответственность
+        count = unassign_all_threads(db_connection, target_username)
+
+        await message.reply_text(
+            f"✅ Снята ответственность @{target_username} с **{count}** тредов.\n"
+            f"Теперь эти треды без ответственного менеджера."
+        )
+        logger.info(f"Менеджер {manager_id} снял ответственность @{target_username} с {count} тредов")
+
+    except Exception as e:
+        logger.error(f"Ошибка при снятии ответственности: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+# Команда /remove_manager - удалить менеджера из системы
+@business.on_message(filters.command("remove_manager") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_remove_manager_command(client, message):
+    """
+    Полностью удалить менеджера из системы.
+    Использование: /remove_manager @менеджер
+    """
+    try:
+        # Проверяем, авторизован ли менеджер
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Используйте /auth для авторизации."
+            )
+            return
+
+        # Парсим аргументы
+        args = message.text.split()[1:]
+        if len(args) < 1:
+            await message.reply_text(
+                "**Использование:** `/remove_manager @менеджер`\n\n"
+                "Удаляет менеджера из системы полностью:\n"
+                "• Снимает со всех тредов\n"
+                "• Удаляет из базы данных\n\n"
+                "Пример: `/remove_manager @ivan`"
+            )
+            return
+
+        target_username = args[0].lstrip('@')
+
+        # Проверяем, существует ли менеджер
+        from database import get_manager_by_username, remove_manager as db_remove_manager
+        manager_info = get_manager_by_username(db_connection, target_username)
+
+        if not manager_info:
+            await message.reply_text(f"Менеджер @{target_username} не найден в системе.")
+            return
+
+        manager_name = manager_info[1] or target_username
+
+        # Удаляем менеджера
+        success, threads_count = db_remove_manager(db_connection, target_username)
+
+        if success:
+            await message.reply_text(
+                f"✅ Менеджер **{manager_name}** (@{target_username}) удалён из системы.\n"
+                f"Снят с **{threads_count}** тредов."
+            )
+            logger.info(f"Менеджер {manager_id} удалил @{target_username} из системы (снят с {threads_count} тредов)")
+        else:
+            await message.reply_text(f"Не удалось удалить менеджера @{target_username}.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при удалении менеджера: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
 # функция планировщика проверок
 async def schedule_checks():
     # Начальная задержка для полной инициализации клиента
@@ -3155,6 +3319,9 @@ async def handle_help_command(client, message):
 - `/ok [ID_треда]` - Сбросить уведомления для треда
 - `/duties` - Список ответственных менеджеров
 - `/threads` - Список активных тредов
+- `/reassign @старый @новый` - Переназначить все треды
+- `/unassign @менеджер` - Снять ответственность со всех тредов
+- `/remove_manager @менеджер` - Удалить менеджера из системы
 
 📊 **Информация**:
 - `/myinfo` - Ваша информация в системе

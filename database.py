@@ -608,3 +608,94 @@ def cleanup_old_mappings(conn, days=30):
     ''', (days,))
     conn.commit()
     return cursor.rowcount
+
+
+# === Управление менеджерами ===
+
+def get_manager_threads(conn, manager_username):
+    """Получить все треды, назначенные менеджеру"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT dm.thread_id, c.first_name, c.last_name, c.username
+    FROM duty_managers dm
+    LEFT JOIN clients c ON dm.thread_id = c.thread_id
+    WHERE dm.manager_username = ?
+    ''', (manager_username,))
+    return cursor.fetchall()
+
+
+def reassign_all_threads(conn, old_manager_username, new_manager_username, assigned_by):
+    """Переназначить все треды от одного менеджера другому"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    # Получаем количество тредов для переназначения
+    cursor.execute('SELECT COUNT(*) FROM duty_managers WHERE manager_username = ?', (old_manager_username,))
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        return 0
+
+    # Переназначаем все треды
+    cursor.execute('''
+    UPDATE duty_managers
+    SET manager_username = ?, assigned_by = ?, assigned_at = ?
+    WHERE manager_username = ?
+    ''', (new_manager_username, assigned_by, current_time, old_manager_username))
+
+    conn.commit()
+    return count
+
+
+def unassign_all_threads(conn, manager_username):
+    """Снять ответственность со всех тредов менеджера"""
+    cursor = conn.cursor()
+
+    # Получаем количество тредов
+    cursor.execute('SELECT COUNT(*) FROM duty_managers WHERE manager_username = ?', (manager_username,))
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        return 0
+
+    # Удаляем все назначения
+    cursor.execute('DELETE FROM duty_managers WHERE manager_username = ?', (manager_username,))
+    conn.commit()
+    return count
+
+
+def remove_manager(conn, manager_username):
+    """Полностью удалить менеджера из системы"""
+    cursor = conn.cursor()
+
+    # Сначала находим manager_id по username
+    cursor.execute('SELECT manager_id FROM managers WHERE username = ?', (manager_username,))
+    result = cursor.fetchone()
+
+    if not result:
+        return False, 0
+
+    manager_id = result[0]
+
+    # Снимаем со всех тредов
+    cursor.execute('SELECT COUNT(*) FROM duty_managers WHERE manager_username = ?', (manager_username,))
+    threads_count = cursor.fetchone()[0]
+    cursor.execute('DELETE FROM duty_managers WHERE manager_username = ?', (manager_username,))
+
+    # Удаляем записи о первых ответах
+    cursor.execute('DELETE FROM first_replies WHERE manager_id = ?', (manager_id,))
+
+    # Удаляем менеджера
+    cursor.execute('DELETE FROM managers WHERE manager_id = ?', (manager_id,))
+
+    conn.commit()
+    return True, threads_count
+
+
+def get_manager_by_username(conn, username):
+    """Получить менеджера по username"""
+    cursor = conn.cursor()
+    # username может быть с @ или без
+    clean_username = username.lstrip('@')
+    cursor.execute('SELECT manager_id, name, username FROM managers WHERE username = ?', (clean_username,))
+    return cursor.fetchone()
