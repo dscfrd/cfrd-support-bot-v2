@@ -420,10 +420,36 @@ def get_company_name(conn, thread_id):
 
 
 def get_client_info_for_thread_title(conn, thread_id):
-    """Получить информацию о клиенте для заголовка треда: (first_name, last_name, company_name)"""
+    """Получить информацию о клиенте для заголовка треда: (first_name, last_name, company_name, custom_id)"""
     cursor = conn.cursor()
-    cursor.execute('SELECT first_name, last_name, company_name FROM clients WHERE thread_id = ?', (thread_id,))
+    cursor.execute('SELECT first_name, last_name, company_name, custom_id FROM clients WHERE thread_id = ?', (thread_id,))
     return cursor.fetchone()
+
+
+def format_thread_title(thread_id, first_name, last_name=None, company_name=None, custom_id=None):
+    """Форматировать заголовок треда.
+
+    Формат:
+    - Если custom_id задан: "CUSTOM_ID: Имя | Компания (thread_id)" или "CUSTOM_ID: Имя (thread_id)"
+    - Если custom_id не задан: "thread_id: Имя | Компания" или "thread_id: Имя"
+    """
+    # Формируем имя клиента
+    client_name = (first_name or "").strip()
+    if last_name:
+        client_name += f" {last_name}".strip()
+
+    if custom_id:
+        # Формат с custom_id: "ID: Имя | Компания (№)"
+        if company_name:
+            return f"{custom_id}: {client_name} | {company_name} ({thread_id})"
+        else:
+            return f"{custom_id}: {client_name} ({thread_id})"
+    else:
+        # Формат без custom_id: "№: Имя | Компания"
+        if company_name:
+            return f"{thread_id}: {client_name} | {company_name}"
+        else:
+            return f"{thread_id}: {client_name}"
 
 
 # === Ответственные менеджеры ===

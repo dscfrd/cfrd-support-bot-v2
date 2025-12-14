@@ -1105,31 +1105,27 @@ async def mark_thread_urgent(client, thread_id, is_urgent=True):
     try:
         # Проверяем, известно ли нам текущее состояние треда
         current_state = thread_title_states.get(thread_id, {"has_alert": False, "title": None})
-        
+
         # Если уже в нужном состоянии, ничего не делаем
         if (is_urgent and current_state["has_alert"]) or (not is_urgent and not current_state["has_alert"]):
             logger.info(f"Тред {thread_id} уже в нужном состоянии (alert={is_urgent})")
             return True
-            
+
         # Получаем информацию о клиенте для заголовка
-        client_info = get_client_info_by_thread(db_connection, thread_id)
-        
+        from database import get_client_info_for_thread_title, format_thread_title
+        client_info = get_client_info_for_thread_title(db_connection, thread_id)
+
         if not client_info:
             logger.error(f"Не удалось найти клиента для треда {thread_id}")
             return False
-            
-        # Формируем имя клиента
-        first_name, last_name, username = client_info
-        client_name = f"{first_name or ''}"
-        if last_name:
-            client_name += f" {last_name}"
-        if username:
-            client_name += f" (@{username})"
-            
-        # Формируем базовый и полный заголовок с индикатором
-        base_title = f"{thread_id}: {client_name}"
+
+        # Распаковываем информацию о клиенте
+        first_name, last_name, company_name, custom_id = client_info
+
+        # Формируем заголовок через централизованную функцию
+        base_title = format_thread_title(thread_id, first_name, last_name, company_name, custom_id)
         alert_title = f"🔥{base_title}"
-        
+
         # Выбираем заголовок в зависимости от нужного состояния
         new_title = alert_title if is_urgent else base_title
             
@@ -2528,11 +2524,18 @@ async def handle_set_custom_id(client, message):
                 await message.reply_text(f"❌ {error}")
                 return
 
+            # Обновляем заголовок треда с новым custom_id
+            from database import format_thread_title, get_company_name
+            company_name = get_company_name(db_connection, thread_id)
+            new_title = format_thread_title(thread_id, first_name, last_name, company_name, result_id)
+            await edit_thread_title(client, thread_id, new_title)
+
             await message.reply_text(
                 f"✅ **ID установлен:** `#{result_id}`\n"
                 f"**Клиент:** {client_name}\n"
                 f"**Thread:** {thread_id}\n\n"
-                f"Используйте `/{result_id} текст` для ответа"
+                f"Используйте `/{result_id} текст` для ответа\n"
+                f"Заголовок треда обновлён"
             )
             logger.info(f"Менеджер {manager_id} установил ID #{new_id} для клиента {user_id}")
         else:
@@ -2605,18 +2608,19 @@ async def handle_set_company(client, message):
 
         first_name = client_data[1] or ""
         last_name = client_data[2] or ""
+        custom_id = client_data[8] if len(client_data) > 8 else None
         client_name = f"{first_name} {last_name}".strip()
 
         if len(command_parts) >= 3:
             # Устанавливаем название компании
             company_name = command_parts[2].strip()
 
-            from database import set_company_name
+            from database import set_company_name, format_thread_title
             success = set_company_name(db_connection, thread_id, company_name)
 
             if success:
-                # Обновляем заголовок треда: "№: Имя | Компания"
-                new_title = f"{thread_id}: {client_name} | {company_name}"
+                # Обновляем заголовок треда через централизованную функцию
+                new_title = format_thread_title(thread_id, first_name, last_name, company_name, custom_id)
                 await edit_thread_title(client, thread_id, new_title)
 
                 await message.reply_text(
@@ -3528,7 +3532,8 @@ async def handle_help_command(client, message):
 📊 **Информация**:
 - `/myinfo` - Ваша информация в системе
 - `/group_info [ID_треда]` - Информация о группе
-- `/help` - Это сообщение
+- `/help` - Краткая справка
+- `/readme` - Скачать полное руководство
 
 ℹ️ **Подсказки**:
 - ID клиента: русские буквы и цифры (например: Иванов, Клиент123)
@@ -3541,6 +3546,30 @@ async def handle_help_command(client, message):
     except Exception as e:
         logger.error(f"Ошибка при отправке справки: {e}")
         await message.reply_text(f"Произошла ошибка: {e}")
+
+
+@business.on_message(filters.command("readme") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_readme_command(client, message):
+    """Отправить файл README с полным описанием бота"""
+    try:
+        logger.info(f"Получена команда /readme от пользователя {message.from_user.id}")
+
+        readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.txt")
+
+        if os.path.exists(readme_path):
+            await message.reply_document(
+                document=readme_path,
+                caption="Руководство по использованию CFRD Support Bot v2"
+            )
+            logger.info("README.txt отправлен")
+        else:
+            await message.reply_text("Файл README.txt не найден")
+            logger.error(f"README.txt не найден по пути: {readme_path}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке README: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
 
 # Обработчик нажатий на кнопки команд
 @business.on_callback_query(filters.regex(r"^cmd_"))
