@@ -13,6 +13,12 @@ SESSION_NAME = "business_account_test"
 # === Группа поддержки (ТЕСТОВАЯ) ===
 SUPPORT_GROUP_ID = -1003317645437
 
+# === Канал-хранилище файлов ===
+FILES_CHANNEL_ID = -1003563685324
+
+# === Кастом эмодзи менеджеров ===
+EMOJI_PACK_NAME = "cfrd_managers_emoji"
+
 # === База данных ===
 DATABASE_NAME = "clients_test.db"
 

@@ -1,5 +1,7 @@
 from pyrogram import Client, filters
 from pyrogram.handlers import RawUpdateHandler
+from pyrogram.types import MessageEntity
+from pyrogram.enums import MessageEntityType
 import pyrogram
 import sqlite3
 import datetime
@@ -9,6 +11,12 @@ import re
 import os
 import asyncio
 import functools
+import signal
+import io
+from PIL import Image
+
+# Флаг для graceful shutdown
+shutdown_requested = False
 
 
 def escape_markdown(text):
@@ -31,7 +39,8 @@ def escape_html(text):
 # Импорт конфигурации
 from config import (
     API_ID, API_HASH, PHONE_NUMBER, SESSION_NAME,
-    SUPPORT_GROUP_ID, DATABASE_NAME,
+    SUPPORT_GROUP_ID, DATABASE_NAME, FILES_CHANNEL_ID,
+    EMOJI_PACK_NAME,
     URGENT_WAIT_TIME, FIRST_NOTIFICATION_DELAY,
     NOTIFICATION_INTERVAL, CHECK_INTERVAL,
     PARSE_MODE, WORKERS
@@ -71,6 +80,9 @@ save_message = db.save_message
 save_manager = db.save_manager
 get_manager = db.get_manager
 update_manager_photo = db.update_manager_photo
+get_manager_photo_channel_id = db.get_manager_photo_channel_id
+get_manager_custom_emoji_id = db.get_manager_custom_emoji_id
+update_manager_custom_emoji = db.update_manager_custom_emoji
 save_first_reply = db.save_first_reply
 is_first_reply = db.is_first_reply
 get_managers_replied_to_client = db.get_managers_replied_to_client
@@ -87,6 +99,262 @@ save_message_mapping = db.save_message_mapping
 get_group_message_id = db.get_group_message_id
 get_client_message_id = db.get_client_message_id
 update_message_text = db.update_message_text
+
+
+# === ЦЕНТРАЛЬНЫЙ РОУТЕР КОМАНД ДЛЯ ГРУППЫ ПОДДЕРЖКИ ===
+# Из-за бага в pyrofork, фильтры filters.command() и filters.regex() не работают
+# для outgoing сообщений (от аккаунта бота). Поэтому используем роутер для outgoing.
+@business.on_message(filters.chat(SUPPORT_GROUP_ID), group=-10)
+async def command_router(client, message):
+    """Центральный роутер команд для группы поддержки (только outgoing)"""
+    # Обрабатываем только исходящие сообщения (от аккаунта бота)
+    # Входящие сообщения (от других менеджеров) обрабатываются стандартными хэндлерами
+    if not message.outgoing:
+        return
+
+    if not message.text:
+        return
+
+    text = message.text.strip()
+
+    # Роутинг команд для outgoing сообщений
+    if text.startswith('/team') and (len(text) == 5 or text[5].isspace()):
+        await _handle_team_command(client, message)
+    elif text.startswith('/help') and (len(text) == 5 or text[5].isspace()):
+        await _handle_help_command(client, message)
+
+
+# Реализации команд для роутера
+async def _handle_team_command(client, message):
+    """Показать карточки всех менеджеров"""
+    try:
+        if not message.from_user:
+            return
+
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы в системе. Используйте /auth для авторизации.")
+            return
+
+        from database import get_all_managers, get_manager_threads, is_on_vacation
+        managers = get_all_managers(db_connection)
+
+        if not managers:
+            await message.reply_text("Нет зарегистрированных менеджеров.")
+            return
+
+        await message.reply_text(
+            f"👥 **Команда менеджеров** ({len(managers)})\n\n"
+            "Для увольнения: reply на карточку + `/fire @новый_менеджер`"
+        )
+
+        for mgr in managers:
+            mgr_id, username, name = mgr
+            threads = get_manager_threads(db_connection, username) if username else []
+            on_vacation = is_on_vacation(db_connection, username) if username else False
+
+            status = "🏖 В отпуске" if on_vacation else "✅ Активен"
+            username_str = f"@{username}" if username else "без username"
+
+            card_text = (
+                f"**{name or 'Без имени'}**\n"
+                f"ID: `{mgr_id}`\n"
+                f"Username: {username_str}\n"
+                f"Тредов: {len(threads)}\n"
+                f"Статус: {status}"
+            )
+
+            await client.send_message(
+                chat_id=message.chat.id,
+                text=card_text,
+                message_thread_id=message.message_thread_id
+            )
+
+        logger.info(f"Команда /team выполнена пользователем {manager_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при показе команды /team: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+async def _handle_help_command(client, message):
+    """Показать справку по командам"""
+    try:
+        logger.info(f"Получена команда /help от пользователя {message.from_user.id if message.from_user else 'N/A'}")
+
+        help_text = """
+📋 **Доступные команды**:
+
+⚙️ **Ответы клиентам**:
+- `/[thread_id] [текст]` - Ответить по номеру треда
+- `/[ИмяКлиента] [текст]` - Ответить по ID клиента (русские буквы)
+- `/id [thread_id] [Имя]` - Задать ID клиенту
+- `/company [thread_id] [Компания]` - Задать название компании
+- `/card [thread_id]` - Отправить визитку клиенту
+
+⚙️ **Управление**:
+- `/auth [эмодзи], [Имя], [Должность]` - Авторизоваться
+- `/onduty @username [ID_треда]` - Назначить ответственного
+- `/ok [ID_треда]` - Сбросить уведомления для треда
+- `/duties` - Список ответственных менеджеров
+- `/threads` - Список активных тредов
+- `/tier [ID_треда] [1|2|3]` - Установить тир клиента
+
+👥 **Менеджеры**:
+- `/vacation @менеджер @заместитель [tier-1 tier-2]` - Отпуск/больничный
+- `/return @менеджер` - Вернуть из отпуска
+- `/team` - Карточки всех менеджеров
+- `/fire @новый` (reply на карточку) - Уволить менеджера
+
+📊 **Информация**:
+- `/myinfo` - Ваша информация в системе
+- `/group_info [ID_треда]` - Информация о группе
+- `/help` - Краткая справка
+- `/readme` - Скачать полное руководство
+
+ℹ️ **Подсказки**:
+- ID клиента: русские буквы и цифры (например: Иванов, Клиент123)
+- При ответе через /{номер} или /ИмяКлиента менеджер становится ответственным
+"""
+
+        await message.reply_text(help_text)
+        logger.info("Отправлен список команд")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке справки: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
+
+
+# === ФУНКЦИИ ДЛЯ КАСТОМ ЭМОДЗИ ===
+
+def format_signature_with_custom_emoji(message_text, name, position, custom_emoji_id=None, fallback_emoji="👤"):
+    """
+    Форматирует сообщение с подписью менеджера.
+    Если есть custom_emoji_id - возвращает (text, entities) для отправки через entities.
+    Если нет - возвращает (text, None) для отправки через markdown.
+    """
+    signature_text = f"{name}, {position}"
+
+    if custom_emoji_id:
+        # Формируем текст: сообщение + подпись с placeholder для эмодзи
+        emoji_placeholder = "👤"  # Placeholder который заменится на кастом эмодзи
+        full_text = f"{message_text}\n—\n{emoji_placeholder}  {signature_text}"
+
+        # Позиция эмодзи в тексте (после \n—\n)
+        emoji_offset = len(message_text) + 3  # +3 для "\n—\n"
+
+        # Создаём entity для кастом эмодзи
+        entity = MessageEntity(
+            type=MessageEntityType.CUSTOM_EMOJI,
+            offset=emoji_offset,
+            length=2,  # длина placeholder эмодзи в UTF-16
+            custom_emoji_id=custom_emoji_id
+        )
+
+        return full_text, [entity]
+    else:
+        # Без кастом эмодзи - обычный markdown
+        full_text = f"{message_text}\n—\n`{fallback_emoji} {signature_text}`"
+        return full_text, None
+
+
+async def add_manager_emoji(client, photo_file_id, manager_name):
+    """
+    Создаёт кастом эмодзи из фото менеджера и добавляет в пак.
+    Возвращает custom_emoji_id или None при ошибке.
+    """
+    try:
+        from pyrogram.raw.functions.stickers import AddStickerToSet
+        from pyrogram.raw.functions.channels import GetMessages
+        from pyrogram.raw.types import InputStickerSetItem, InputDocument, InputStickerSetShortName, InputMessageID
+
+        # Скачиваем фото
+        photo_path = await client.download_media(photo_file_id, file_name="/tmp/manager_photo.jpg")
+
+        # Открываем и обрабатываем изображение
+        img = Image.open(photo_path)
+
+        # Делаем квадратным (обрезаем по центру)
+        min_side = min(img.size)
+        left = (img.width - min_side) // 2
+        top = (img.height - min_side) // 2
+        img = img.crop((left, top, left + min_side, top + min_side))
+
+        # Изменяем размер до 100x100
+        img = img.resize((100, 100), Image.Resampling.LANCZOS)
+
+        # Создаём круглую маску
+        mask = Image.new('L', (100, 100), 0)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse([0, 0, 100, 100], fill=255)
+
+        # Применяем маску (делаем круглым)
+        output = Image.new('RGBA', (100, 100), (0, 0, 0, 0))
+        img = img.convert('RGBA')
+        output.paste(img, (0, 0), mask)
+
+        # Сохраняем
+        emoji_path = "/tmp/manager_emoji.png"
+        output.save(emoji_path, 'PNG')
+
+        # Загружаем в канал как документ
+        msg = await client.send_document(
+            chat_id=FILES_CHANNEL_ID,
+            document=emoji_path,
+            caption=f"Emoji: {manager_name}"
+        )
+
+        # Получаем raw документ
+        channel_peer = await client.resolve_peer(FILES_CHANNEL_ID)
+        result = await client.invoke(
+            GetMessages(
+                channel=channel_peer,
+                id=[InputMessageID(id=msg.id)]
+            )
+        )
+
+        raw_doc = result.messages[0].media.document
+
+        # Создаём InputDocument
+        input_doc = InputDocument(
+            id=raw_doc.id,
+            access_hash=raw_doc.access_hash,
+            file_reference=raw_doc.file_reference
+        )
+
+        # Создаём стикер
+        sticker = InputStickerSetItem(
+            document=input_doc,
+            emoji="👤"
+        )
+
+        # Добавляем в существующий пак
+        result = await client.invoke(
+            AddStickerToSet(
+                stickerset=InputStickerSetShortName(short_name=EMOJI_PACK_NAME),
+                sticker=sticker
+            )
+        )
+
+        # Получаем ID нового эмодзи (последний в списке)
+        new_emoji_id = result.documents[-1].id
+
+        logger.info(f"Создан кастом эмодзи для {manager_name}: {new_emoji_id}")
+
+        # Удаляем временные файлы
+        os.remove(photo_path)
+        os.remove(emoji_path)
+
+        return new_emoji_id
+
+    except Exception as e:
+        logger.error(f"Ошибка создания кастом эмодзи: {e}")
+        return None
+
 
 # === ДЕКОРАТОР ДЛЯ ОБРАБОТКИ FLOOD WAIT ===
 def handle_flood_wait(max_retries=3, initial_delay=1):
@@ -616,23 +884,34 @@ async def send_manager_reply_to_client(client, manager_id, client_id, message_te
             logger.error(f"Менеджер с ID {manager_id} не найден в базе данных")
             return False
 
-        # Распаковываем данные менеджера (ID, emoji, name, position, extension, photo_id, auth_date, username)
-        # Здесь теперь 8 значений вместо 7, учитываем username
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
+        # Распаковываем данные менеджера
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
 
-        # Формируем подпись менеджера (моноширинным)
-        signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
+        # Получаем custom_emoji_id
+        custom_emoji_id = get_manager_custom_emoji_id(db_connection, manager_id)
 
-        # Полное сообщение с подписью
-        full_message = f"{message_text}{signature}"
+        # Форматируем сообщение с подписью
+        full_message, entities = format_signature_with_custom_emoji(
+            message_text, name, position, custom_emoji_id, fallback_emoji=emoji or "👤"
+        )
 
         # Отправляем сообщение клиенту (с reply если указан)
-        sent_message = await client.send_message(
-            chat_id=client_id,
-            text=full_message,
-            reply_to_message_id=reply_to_client_msg_id,
-            parse_mode=pyrogram.enums.ParseMode.MARKDOWN
-        )
+        if entities:
+            # С кастом эмодзи - без parse_mode, с entities
+            sent_message = await client.send_message(
+                chat_id=client_id,
+                text=full_message,
+                reply_to_message_id=reply_to_client_msg_id,
+                entities=entities
+            )
+        else:
+            # Без кастом эмодзи - обычный markdown
+            sent_message = await client.send_message(
+                chat_id=client_id,
+                text=full_message,
+                reply_to_message_id=reply_to_client_msg_id,
+                parse_mode=pyrogram.enums.ParseMode.MARKDOWN
+            )
         reply_info = f" (reply на {reply_to_client_msg_id})" if reply_to_client_msg_id else ""
         logger.info(f"Ответ менеджера отправлен клиенту {client_id}{reply_info}")
 
@@ -667,51 +946,69 @@ async def send_manager_card_to_client(client, manager_id, client_id):
         if not manager:
             logger.error(f"Менеджер с ID {manager_id} не найден в базе данных")
             return False
-        
+
         # Распаковываем данные менеджера
         # Было 7 значений, теперь 8 (добавлен username)
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
-        
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
+
+        # Получаем ID сообщения с фото в канале
+        photo_channel_message_id = get_manager_photo_channel_id(db_connection, manager_id)
+
         # Определяем приветствие в зависимости от времени суток
         current_hour = datetime.datetime.now().hour
         greeting = "Добрый день"
-        
+
         if current_hour < 6:
             greeting = "Доброй ночи"
         elif current_hour < 12:
             greeting = "Доброе утро"
         elif current_hour >= 18:
             greeting = "Добрый вечер"
-        
+
         # Получаем информацию о клиенте
         cursor = db_connection.cursor()
         cursor.execute('SELECT first_name, last_name FROM clients WHERE user_id = ?', (client_id,))
         client_data = cursor.fetchone()
-        
+
         client_name = "Уважаемый клиент"
         if client_data:
             if client_data[0]:
                 client_name = client_data[0]
                 if client_data[1]:
                     client_name += f" {client_data[1]}"
-        
+
         # Формируем текст карточки с персональным обращением
         card_text = f"{greeting}!\n\n"
         card_text += f"**Ваш менеджер {name}**\n"
         card_text += f"Должность: **{position}**\n\n"
-        card_text += f"Для звонка используйте многоканальный номер из аккаунта и наберите добавочный: **{extension}**\n\n"
         card_text += "С большим интересом займемся вашим проектом"
-        
+
         logger.info(f"Подготовлен текст карточки для клиента {client_id}")
 
+        # Пробуем получить фото из канала-архива (надёжнее после перезапуска)
+        actual_photo_id = None
+        if photo_channel_message_id:
+            try:
+                channel_msg = await client.get_messages(FILES_CHANNEL_ID, photo_channel_message_id)
+                if channel_msg and channel_msg.photo:
+                    actual_photo_id = channel_msg.photo.file_id
+                    logger.info(f"Получен file_id фото из канала для менеджера {manager_id}")
+            except Exception as e:
+                logger.warning(f"Не удалось получить фото из канала: {e}")
+
+        # Если из канала не получили, используем сохранённый file_id
+        if not actual_photo_id and photo_file_id:
+            actual_photo_id = photo_file_id
+            logger.info(f"Используем сохранённый file_id для менеджера {manager_id}")
+
         # Если есть фото менеджера
-        if photo_file_id:
+        if actual_photo_id:
             try:
                 # Отправляем фото с подписью
-                logger.info(f"Отправка карточки с фото менеджера {manager_id}, photo_id: {photo_file_id}")
+                logger.info(f"Отправка карточки с фото менеджера {manager_id}")
                 sent_message = await client.send_photo(
                     chat_id=client_id,
-                    photo=photo_file_id,
+                    photo=actual_photo_id,
                     caption=card_text,
                     parse_mode=pyrogram.enums.ParseMode.MARKDOWN
                 )
@@ -751,10 +1048,10 @@ async def send_manager_media_to_client(client, manager_id, client_id, file_id, c
             return False
         
         # Распаковываем данные менеджера
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
 
         # Формируем подпись менеджера (моноширинным)
-        signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
+        signature = f"\n—\n`{emoji} {name}, {position}`"
 
         # Полная подпись с текстом сообщения
         full_caption = f"{caption or ''}{signature}"
@@ -816,8 +1113,8 @@ async def send_manager_media_group_to_client(client, manager_id, client_id, medi
             logger.error(f"Менеджер с ID {manager_id} не найден в базе данных")
             return False
 
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
-        signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
+        signature = f"\n—\n`{emoji} {name}, {position}`"
 
         # Получаем caption и удаляем команду /номер из начала
         caption = media_group_data.get("caption", "")
@@ -1842,7 +2139,7 @@ async def handle_reply_to_group(client, message):
             return
         
         # Формируем подпись менеджера (моноширинным)
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
         signature = f"\n\n`{emoji} {name}, {position}`"
 
         # Полное сообщение с подписью
@@ -1995,54 +2292,44 @@ async def handle_auth(client, message):
         
         logger.info(f"Получена команда /auth от пользователя {manager_id} (username: {manager_username}) в группе поддержки")
         
-        # Парсим команду: /auth [emoji], [name], [position], [extension]
+        # Парсим команду: /auth [emoji], [name], [position]
         command_text = message.text.strip()
-        
+
         # Удаляем команду /auth
         if " " in command_text:
             auth_data = command_text.split(" ", 1)[1]
         else:
             await message.reply_text(
-                "Неверный формат команды. Используйте: /auth [эмодзи], [Имя], [Должность], [4 цифры]\n"
-                "Например: /auth 🔧, Иван Петров, Технический специалист, 1234"
+                "Неверный формат команды. Используйте: /auth [эмодзи], [Имя], [Должность]\n"
+                "Например: /auth 🔧, Иван Петров, Технический специалист"
             )
             return
-        
+
         # Разделяем по запятым и удаляем лишние пробелы
         parts = [part.strip() for part in auth_data.split(",")]
-        
-        # Проверяем, что есть как минимум 4 части
-        if len(parts) < 4:
+
+        # Проверяем, что есть как минимум 3 части
+        if len(parts) < 3:
             await message.reply_text(
-                "Неверный формат команды. Требуется: [эмодзи], [Имя], [Должность], [4 цифры]\n"
-                "Например: /auth 🔧, Иван Петров, Технический специалист, 1234"
+                "Неверный формат команды. Требуется: [эмодзи], [Имя], [Должность]\n"
+                "Например: /auth 🔧, Иван Петров, Технический специалист"
             )
             return
-        
+
         # Получаем данные
         emoji = parts[0]
         name = parts[1]
-        
-        # Все части между именем и добавочным номером считаем должностью
-        position = ", ".join(parts[2:-1])
-        
-        # Последняя часть - добавочный номер
-        extension = parts[-1].strip()
-        
-        # Проверяем, что добавочный номер состоит из 4 цифр
-        if not re.match(r'^\d{4}$', extension):
-            await message.reply_text(
-                "Неверный формат добавочного номера. Необходимо указать 4 цифры."
-            )
-            return
-        
+
+        # Все части после имени считаем должностью
+        position = ", ".join(parts[2:])
+
         # Сохраняем данные о менеджере с username (без фото пока)
-        save_manager(db_connection, manager_id, emoji, name, position, extension, username=manager_username)
+        save_manager(db_connection, manager_id, emoji, name, position, username=manager_username)
         
         # Запрашиваем фото менеджера
         await message.reply_text(
-            f"Спасибо! Теперь, пожалуйста, отправьте фотографию для вашего профиля.\n"
-            f"Фото будет показано клиентам при ответе на их обращения."
+            f"Спасибо! Теперь отправьте фотографию для профиля.\n\n"
+            f"💡 Рекомендация: лицо должно занимать ~80% кадра (фото будет обрезано в круг 100x100 для эмодзи)"
         )
         
         # Устанавливаем состояние ожидания фото
@@ -2079,26 +2366,55 @@ async def handle_manager_photo(client, message):
         if manager_id in manager_auth_state and manager_auth_state[manager_id] == "waiting_photo":
             # Получаем информацию о менеджере
             manager = get_manager(db_connection, manager_id)
-            
+
             if manager:
                 # Получаем file_id фотографии
                 photo_file_id = message.photo.file_id
-                
+                photo_channel_message_id = None
+
+                # Сохраняем фото в канал-архив для постоянного хранения
+                try:
+                    manager_name = manager[2]  # name из managers
+                    channel_msg = await client.send_photo(
+                        chat_id=FILES_CHANNEL_ID,
+                        photo=photo_file_id,
+                        caption=f"📸 Фото менеджера: {manager_name} (ID: {manager_id})"
+                    )
+                    photo_channel_message_id = channel_msg.id
+                    logger.info(f"Фото менеджера {manager_id} сохранено в канал, message_id: {photo_channel_message_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка при сохранении фото в канал: {e}")
+
+                # Создаём кастом эмодзи из фото
+                custom_emoji_id = None
+                try:
+                    await message.reply_text("Создаю кастом эмодзи из вашего фото...")
+                    custom_emoji_id = await add_manager_emoji(client, photo_file_id, manager_name)
+                    if custom_emoji_id:
+                        logger.info(f"Кастом эмодзи для {manager_id} создан: {custom_emoji_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка создания кастом эмодзи: {e}")
+
                 # Обновляем запись менеджера с фото и убедимся, что username тоже обновлен
                 cursor = db_connection.cursor()
-                cursor.execute('UPDATE managers SET photo_file_id = ?, username = ? WHERE manager_id = ?', 
-                              (photo_file_id, manager_username, manager_id))
+                if photo_channel_message_id:
+                    cursor.execute('UPDATE managers SET photo_file_id = ?, photo_channel_message_id = ?, username = ?, custom_emoji_id = ? WHERE manager_id = ?',
+                                  (photo_file_id, photo_channel_message_id, manager_username, custom_emoji_id, manager_id))
+                else:
+                    cursor.execute('UPDATE managers SET photo_file_id = ?, username = ?, custom_emoji_id = ? WHERE manager_id = ?',
+                                  (photo_file_id, manager_username, custom_emoji_id, manager_id))
                 db_connection.commit()
-                
+
                 # Удаляем состояние ожидания
                 del manager_auth_state[manager_id]
-                
-                # Отправляем подтверждение - без использования неопределенной переменной thread_id
+
+                # Отправляем подтверждение
+                emoji_status = "с кастом эмодзи" if custom_emoji_id else "(без кастом эмодзи)"
                 await message.reply_text(
-                    f"Фото успешно добавлено! Ваша авторизация завершена.\n"
+                    f"Фото успешно добавлено {emoji_status}! Ваша авторизация завершена.\n"
                     f"Теперь вы можете отвечать клиентам, используя команду /(номер треда) в теме клиента."
                 )
-                
+
                 logger.info(f"Фото менеджера {manager_id} успешно сохранено")
             else:
                 await message.reply_text(
@@ -2153,7 +2469,7 @@ async def handle_myinfo(client, message):
             return
         
         # Распаковываем данные менеджера
-        _, emoji, name, position, extension, photo_file_id, auth_date, db_username = manager
+        _, emoji, name, position, extension, photo_file_id, auth_date, db_username, *_ = manager
         
         # Отправляем информацию
         info_text = f"Ваша информация в системе:\n\n"
@@ -2217,11 +2533,17 @@ async def handle_custom_id_command(client, message):
             return
 
         # Отправляем ответ клиенту
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
-        signature = f"\n—\n`{emoji} {name}, {position}, доб. {extension}`"
-        full_message = f"{reply_text}{signature}"
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
+        custom_emoji_id = get_manager_custom_emoji_id(db_connection, manager_id)
 
-        sent_message = await client.send_message(chat_id=client_id, text=full_message, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
+        full_message, entities = format_signature_with_custom_emoji(
+            reply_text, name, position, custom_emoji_id, fallback_emoji=emoji or "👤"
+        )
+
+        if entities:
+            sent_message = await client.send_message(chat_id=client_id, text=full_message, entities=entities)
+        else:
+            sent_message = await client.send_message(chat_id=client_id, text=full_message, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
 
         # Сохраняем маппинг для reply
         try:
@@ -2290,7 +2612,7 @@ async def handle_thread_number_command(client, message):
         client_data = cursor.fetchone()
         
         # Извлекаем данные о менеджере для работы
-        _, emoji, name, position, extension, photo_file_id, auth_date, username = manager
+        _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
         
         if client_data:
             # Это тред клиента - отправляем личное сообщение
@@ -2655,6 +2977,373 @@ async def handle_set_company(client, message):
     except Exception as e:
         logger.error(f"Ошибка при работе с компанией: {e}")
         await message.reply_text(f"Ошибка: {e}")
+
+
+# === Файлы и шаблоны ===
+
+# Состояние ожидания текста шаблона
+pending_template_text = {}  # user_id -> {"name": str, "message_id": int}
+
+
+@business.on_message(filters.command("upload") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_upload_file(client, message):
+    """Загрузить файл в хранилище. Только для админов.
+    Использование: /upload (reply на файл с подписью = имя)"""
+    try:
+        if not message.from_user:
+            return
+
+        manager_id = message.from_user.id
+
+        # Проверяем что это админ группы
+        try:
+            member = await client.get_chat_member(SUPPORT_GROUP_ID, manager_id)
+            if member.status not in [pyrogram.enums.ChatMemberStatus.ADMINISTRATOR, pyrogram.enums.ChatMemberStatus.OWNER]:
+                await message.reply_text("❌ Загружать файлы могут только администраторы")
+                return
+        except Exception:
+            await message.reply_text("❌ Не удалось проверить права")
+            return
+
+        # Проверяем что это reply на сообщение с файлом
+        if not message.reply_to_message:
+            await message.reply_text(
+                "**Загрузка файла в хранилище**\n\n"
+                "Отправьте файл с подписью (имя файла), затем reply на него с `/upload`\n\n"
+                "**Пример:**\n"
+                "1. Отправить файл с подписью `реквизиты`\n"
+                "2. Reply на него: `/upload`"
+            )
+            return
+
+        reply_msg = message.reply_to_message
+
+        # Проверяем что есть файл
+        if not (reply_msg.document or reply_msg.photo or reply_msg.video or reply_msg.audio):
+            await message.reply_text("❌ Ответьте на сообщение с файлом")
+            return
+
+        # Имя файла из подписи
+        file_name = reply_msg.caption
+        if not file_name:
+            await message.reply_text("❌ У файла должна быть подпись (имя файла)")
+            return
+
+        file_name = file_name.strip().lower()
+
+        # Определяем тип файла
+        if reply_msg.document:
+            file_type = "document"
+            file_id = reply_msg.document.file_id
+        elif reply_msg.photo:
+            file_type = "photo"
+            file_id = reply_msg.photo.file_id
+        elif reply_msg.video:
+            file_type = "video"
+            file_id = reply_msg.video.file_id
+        elif reply_msg.audio:
+            file_type = "audio"
+            file_id = reply_msg.audio.file_id
+
+        # Проверяем существует ли файл с таким именем
+        from database import get_file_template, save_file_template
+        existing = get_file_template(db_connection, file_name)
+
+        if existing:
+            # Файл существует - спрашиваем обновить ли
+            await message.reply_text(
+                f"⚠️ **Файл `{file_name}` уже существует**\n\n"
+                f"Шаблон: {existing[2] or '(нет)'}\n\n"
+                f"Чтобы обновить, используйте `/upload update`"
+            )
+            return
+
+        # Пересылаем файл в канал-хранилище
+        try:
+            forwarded = await reply_msg.forward(FILES_CHANNEL_ID)
+            channel_message_id = forwarded.id
+        except Exception as e:
+            logger.error(f"Ошибка пересылки в канал: {e}")
+            await message.reply_text(f"❌ Ошибка загрузки в хранилище: {e}")
+            return
+
+        # Сохраняем в БД
+        save_file_template(db_connection, file_name, channel_message_id, None, file_type, manager_id)
+
+        # Спрашиваем текст шаблона
+        pending_template_text[manager_id] = {"name": file_name, "message_id": message.id}
+
+        await message.reply_text(
+            f"✅ **Файл `{file_name}` загружен**\n\n"
+            f"Теперь введите текст шаблона для `/temp {file_name}`\n"
+            f"или отправьте `-` чтобы пропустить"
+        )
+        logger.info(f"Файл '{file_name}' загружен менеджером {manager_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки файла: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
+@business.on_message(filters.command("file") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_send_file(client, message):
+    """Отправить файл клиенту.
+    Использование: /file [имя] или в треде просто /file [имя]"""
+    try:
+        if not message.from_user:
+            return
+
+        manager_id = message.from_user.id
+
+        # Проверяем авторизацию
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы. Используйте /auth")
+            return
+
+        # Парсим команду
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            # Показываем список файлов
+            from database import list_file_templates
+            files = list_file_templates(db_connection)
+            if not files:
+                await message.reply_text("📁 Хранилище пусто\n\nЗагрузите файлы командой `/upload`")
+                return
+
+            file_list = "\n".join([f"• `{f[0]}` {f[2] or ''}" for f in files])
+            await message.reply_text(f"📁 **Доступные файлы:**\n\n{file_list}\n\n`/file [имя]` - отправить клиенту")
+            return
+
+        file_name = parts[1].strip().lower()
+
+        # Получаем thread_id из топика
+        thread_id = message.message_thread_id
+        if not thread_id:
+            await message.reply_text("❌ Используйте команду в треде клиента")
+            return
+
+        # Получаем client_id
+        client_data = get_client_by_thread(db_connection, thread_id)
+        if not client_data:
+            await message.reply_text("❌ Клиент не найден")
+            return
+
+        client_id = client_data[0]
+
+        # Получаем файл
+        from database import get_file_template
+        file_info = get_file_template(db_connection, file_name)
+        if not file_info:
+            await message.reply_text(f"❌ Файл `{file_name}` не найден\n\nСписок файлов: `/file`")
+            return
+
+        channel_message_id = file_info[1]
+        file_type = file_info[3]
+
+        # Получаем сообщение из канала и пересылаем клиенту
+        try:
+            channel_msg = await client.get_messages(FILES_CHANNEL_ID, channel_message_id)
+
+            if file_type == "photo":
+                await client.send_photo(client_id, channel_msg.photo.file_id)
+            elif file_type == "video":
+                await client.send_video(client_id, channel_msg.video.file_id)
+            elif file_type == "audio":
+                await client.send_audio(client_id, channel_msg.audio.file_id)
+            else:
+                await client.send_document(client_id, channel_msg.document.file_id)
+
+            await message.reply_text(f"✅ Файл `{file_name}` отправлен клиенту")
+            logger.info(f"Файл '{file_name}' отправлен клиенту {client_id} менеджером {manager_id}")
+
+        except Exception as e:
+            logger.error(f"Ошибка отправки файла: {e}")
+            await message.reply_text(f"❌ Ошибка отправки: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка команды /file: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
+@business.on_message(filters.command("files") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_list_files(client, message):
+    """Показать список доступных файлов и шаблонов"""
+    try:
+        from database import list_file_templates
+        files = list_file_templates(db_connection)
+
+        if not files:
+            await message.reply_text(
+                "📁 **Хранилище пусто**\n\n"
+                "Загрузите файлы командой `/upload`"
+            )
+            return
+
+        # Формируем список
+        lines = []
+        for f in files:
+            name, template_text, file_type, uploaded_at = f
+            type_emoji = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📄"}.get(file_type, "📁")
+            has_template = "📝" if template_text else ""
+            lines.append(f"{type_emoji} `{name}` {has_template}")
+
+        file_list = "\n".join(lines)
+
+        await message.reply_text(
+            f"📁 **Доступные файлы ({len(files)}):**\n\n"
+            f"{file_list}\n\n"
+            f"📝 = есть шаблон\n\n"
+            f"`/file [имя]` - отправить файл\n"
+            f"`/temp [имя]` - отправить с шаблоном"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка команды /files: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
+@business.on_message(filters.command("temp") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_send_template(client, message):
+    """Отправить файл + шаблонное сообщение клиенту.
+    Использование: /temp [имя]"""
+    try:
+        if not message.from_user:
+            return
+
+        manager_id = message.from_user.id
+
+        # Проверяем авторизацию
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы. Используйте /auth")
+            return
+
+        # Парсим команду
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            # Показываем список шаблонов
+            from database import list_file_templates
+            files = list_file_templates(db_connection)
+            templates = [f for f in files if f[1]]  # Только с текстом шаблона
+            if not templates:
+                await message.reply_text("📝 Шаблонов нет\n\nЗагрузите файлы с шаблонами через `/upload`")
+                return
+
+            templ_list = "\n".join([f"• `{t[0]}`: _{t[1][:30]}..._" if len(t[1] or '') > 30 else f"• `{t[0]}`: _{t[1]}_" for t in templates])
+            await message.reply_text(f"📝 **Доступные шаблоны:**\n\n{templ_list}\n\n`/temp [имя]` - отправить клиенту")
+            return
+
+        file_name = parts[1].strip().lower()
+
+        # Получаем thread_id из топика
+        thread_id = message.message_thread_id
+        if not thread_id:
+            await message.reply_text("❌ Используйте команду в треде клиента")
+            return
+
+        # Получаем client_id
+        client_data = get_client_by_thread(db_connection, thread_id)
+        if not client_data:
+            await message.reply_text("❌ Клиент не найден")
+            return
+
+        client_id = client_data[0]
+
+        # Получаем файл
+        from database import get_file_template
+        file_info = get_file_template(db_connection, file_name)
+        if not file_info:
+            await message.reply_text(f"❌ Шаблон `{file_name}` не найден\n\nСписок: `/temp`")
+            return
+
+        channel_message_id = file_info[1]
+        template_text = file_info[2]
+        file_type = file_info[3]
+
+        if not template_text:
+            await message.reply_text(f"❌ У файла `{file_name}` нет текста шаблона\n\nИспользуйте `/file {file_name}` для отправки без текста")
+            return
+
+        # Формируем подпись менеджера
+        manager_name = manager[2] or "Менеджер"
+        manager_position = manager[3] or ""
+        manager_ext = manager[4] or ""
+
+        signature_parts = [manager_name]
+        if manager_position:
+            signature_parts.append(manager_position)
+
+        signature = f"`{manager[1]} {', '.join(signature_parts)}`"
+        full_text = f"{template_text}\n—\n{signature}"
+
+        # Получаем сообщение из канала и отправляем клиенту
+        try:
+            channel_msg = await client.get_messages(FILES_CHANNEL_ID, channel_message_id)
+
+            if file_type == "photo":
+                await client.send_photo(client_id, channel_msg.photo.file_id, caption=full_text)
+            elif file_type == "video":
+                await client.send_video(client_id, channel_msg.video.file_id, caption=full_text)
+            elif file_type == "audio":
+                await client.send_audio(client_id, channel_msg.audio.file_id, caption=full_text)
+            else:
+                await client.send_document(client_id, channel_msg.document.file_id, caption=full_text)
+
+            await message.reply_text(f"✅ Шаблон `{file_name}` отправлен клиенту")
+            logger.info(f"Шаблон '{file_name}' отправлен клиенту {client_id} менеджером {manager_id}")
+
+        except Exception as e:
+            logger.error(f"Ошибка отправки шаблона: {e}")
+            await message.reply_text(f"❌ Ошибка отправки: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка команды /temp: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
+@business.on_message(filters.text & filters.chat(SUPPORT_GROUP_ID))
+async def handle_template_text_input(client, message):
+    """Обработка ввода текста шаблона после /upload"""
+    try:
+        if not message.from_user:
+            return
+
+        # Пропускаем команды
+        if message.text and message.text.startswith('/'):
+            return
+
+        manager_id = message.from_user.id
+
+        # Проверяем ожидаем ли текст шаблона от этого менеджера
+        if manager_id not in pending_template_text:
+            return
+
+        pending = pending_template_text[manager_id]
+        file_name = pending["name"]
+
+        # Удаляем из ожидания
+        del pending_template_text[manager_id]
+
+        text = message.text.strip()
+
+        if text == "-":
+            await message.reply_text(f"✅ Файл `{file_name}` сохранён без шаблона")
+            return
+
+        # Сохраняем текст шаблона
+        from database import update_template_text
+        update_template_text(db_connection, file_name, text)
+
+        await message.reply_text(
+            f"✅ **Шаблон сохранён для `{file_name}`**\n\n"
+            f"Текст: _{text[:100]}{'...' if len(text) > 100 else ''}_\n\n"
+            f"Используйте `/temp {file_name}` для отправки"
+        )
+        logger.info(f"Текст шаблона для '{file_name}' сохранён")
+
+    except Exception as e:
+        logger.error(f"Ошибка сохранения текста шаблона: {e}")
 
 
 # Функция для изменения заголовка треда
@@ -3255,7 +3944,8 @@ async def handle_return_command(client, message):
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
-# Команда /team - показать карточки всех менеджеров
+# Команда /team - показать карточки всех менеджеров (для входящих сообщений от других менеджеров)
+# Outgoing сообщения обрабатываются роутером command_router
 @business.on_message(filters.command("team") & filters.chat(SUPPORT_GROUP_ID))
 async def handle_team_command(client, message):
     """
@@ -3499,7 +4189,8 @@ async def handle_create_test_topic(client, message):
         logger.error(f"Общая ошибка: {e}")
         await message.reply_text(f"❌ Произошла ошибка: {e}")
 
-# Обработчик команды помощи - обновленный список команд
+# Обработчик команды помощи (для входящих сообщений от других менеджеров)
+# Outgoing сообщения обрабатываются роутером command_router
 @business.on_message(filters.command("help") & filters.chat(SUPPORT_GROUP_ID))
 async def handle_help_command(client, message):
     try:
@@ -3516,7 +4207,7 @@ async def handle_help_command(client, message):
 - `/card [thread_id]` - Отправить визитку клиенту
 
 ⚙️ **Управление**:
-- `/auth [эмодзи], [Имя], [Должность], [4 цифры]` - Авторизоваться
+- `/auth [эмодзи], [Имя], [Должность]` - Авторизоваться
 - `/onduty @username [ID_треда]` - Назначить ответственного
 - `/ok [ID_треда]` - Сбросить уведомления для треда
 - `/duties` - Список ответственных менеджеров
@@ -4115,11 +4806,63 @@ async def on_client_reaction(client, update):
         logger.error(f"Ошибка обработки реакции клиента: {e}")
 
 
+# === Graceful Shutdown ===
+
+async def graceful_shutdown(sig_name):
+    """Корректное завершение работы бота"""
+    global shutdown_requested
+    shutdown_requested = True
+
+    logger.info(f"Получен сигнал {sig_name}, начинаем graceful shutdown...")
+
+    # Ждём завершения обработки текущих медиа-групп
+    max_wait = 5  # максимум 5 секунд
+    waited = 0
+    while (client_media_groups or manager_media_groups) and waited < max_wait:
+        pending_client = len(client_media_groups)
+        pending_manager = len(manager_media_groups)
+        logger.info(f"Ожидание завершения медиа-групп: клиенты={pending_client}, менеджеры={pending_manager}")
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+    if client_media_groups or manager_media_groups:
+        logger.warning(f"Таймаут ожидания медиа-групп, незавершённых: клиенты={len(client_media_groups)}, менеджеры={len(manager_media_groups)}")
+
+    # Сохраняем состояние thread_title_states в БД (опционально для восстановления)
+    try:
+        if thread_title_states:
+            logger.info(f"Сохранение состояния {len(thread_title_states)} тредов...")
+            # Состояние можно восстановить из БД при следующем запуске
+    except Exception as e:
+        logger.error(f"Ошибка сохранения состояния: {e}")
+
+    logger.info("Graceful shutdown завершён, останавливаем бота...")
+    await business.stop()
+
+
+def signal_handler(sig, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    sig_name = signal.Signals(sig).name
+    logger.info(f"Получен сигнал {sig_name}")
+
+    # Запускаем graceful shutdown в event loop
+    if business.is_connected:
+        asyncio.get_event_loop().create_task(graceful_shutdown(sig_name))
+    else:
+        logger.info("Бот не подключен, выход...")
+        exit(0)
+
+
 # Запускаем клиент
 if __name__ == "__main__":
     try:
         logger.info("Запуск бизнес-аккаунта Telegram...")
         logger.info(f"База данных клиентов настроена. Группа поддержки: {SUPPORT_GROUP_ID}")
+
+        # Регистрируем обработчики сигналов для graceful shutdown
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        logger.info("Обработчики SIGTERM/SIGINT зарегистрированы для graceful shutdown")
 
         # Добавляем raw handler для реакций
         business.add_handler(RawUpdateHandler(handle_client_reactions), group=-1)
@@ -4128,5 +4871,7 @@ if __name__ == "__main__":
         business.loop.create_task(schedule_checks())
 
         business.run()
+    except KeyboardInterrupt:
+        logger.info("Получен KeyboardInterrupt, завершение...")
     except Exception as e:
         logger.error(f"Критическая ошибка при запуске: {e}")

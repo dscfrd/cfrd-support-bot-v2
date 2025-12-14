@@ -84,6 +84,20 @@ def setup_database():
         cursor.execute('ALTER TABLE managers ADD COLUMN username TEXT')
         logger.info("Добавлена колонка username в таблицу managers")
 
+    # Добавляем колонку photo_channel_message_id в managers, если её нет
+    try:
+        cursor.execute('SELECT photo_channel_message_id FROM managers LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE managers ADD COLUMN photo_channel_message_id INTEGER')
+        logger.info("Добавлена колонка photo_channel_message_id в таблицу managers")
+
+    # Добавляем колонку custom_emoji_id в managers, если её нет
+    try:
+        cursor.execute('SELECT custom_emoji_id FROM managers LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE managers ADD COLUMN custom_emoji_id INTEGER')
+        logger.info("Добавлена колонка custom_emoji_id в таблицу managers")
+
     # Таблица первых ответов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS first_replies (
@@ -158,6 +172,20 @@ def setup_database():
         thread_id INTEGER NOT NULL,
         started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(original_manager, thread_id)
+    )
+    ''')
+
+    # Таблица файлов-шаблонов (хранятся в канале)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS file_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        channel_message_id INTEGER NOT NULL,
+        template_text TEXT,
+        file_type TEXT,
+        uploaded_by INTEGER,
+        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
 
@@ -263,8 +291,8 @@ def save_message(conn, user_id, message_text, is_from_user=True, media_type=None
 
 # === Менеджеры ===
 
-def save_manager(conn, manager_id, emoji, name, position, extension, photo_file_id=None, username=None):
-    """Сохранить/обновить менеджера"""
+def save_manager(conn, manager_id, emoji, name, position, extension="", photo_file_id=None, username=None):
+    """Сохранить/обновить менеджера (extension deprecated, оставлен для совместимости)"""
     cursor = conn.cursor()
     current_time = datetime.datetime.now()
 
@@ -283,10 +311,37 @@ def get_manager(conn, manager_id):
     return cursor.fetchone()
 
 
-def update_manager_photo(conn, manager_id, photo_file_id):
+def update_manager_photo(conn, manager_id, photo_file_id, photo_channel_message_id=None):
     """Обновить фото менеджера"""
     cursor = conn.cursor()
-    cursor.execute('UPDATE managers SET photo_file_id = ? WHERE manager_id = ?', (photo_file_id, manager_id))
+    if photo_channel_message_id:
+        cursor.execute('UPDATE managers SET photo_file_id = ?, photo_channel_message_id = ? WHERE manager_id = ?',
+                       (photo_file_id, photo_channel_message_id, manager_id))
+    else:
+        cursor.execute('UPDATE managers SET photo_file_id = ? WHERE manager_id = ?', (photo_file_id, manager_id))
+    conn.commit()
+
+
+def get_manager_photo_channel_id(conn, manager_id):
+    """Получить ID сообщения с фото менеджера в канале"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT photo_channel_message_id FROM managers WHERE manager_id = ?', (manager_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def get_manager_custom_emoji_id(conn, manager_id):
+    """Получить ID кастом эмодзи менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT custom_emoji_id FROM managers WHERE manager_id = ?', (manager_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def update_manager_custom_emoji(conn, manager_id, custom_emoji_id):
+    """Обновить ID кастом эмодзи менеджера"""
+    cursor = conn.cursor()
+    cursor.execute('UPDATE managers SET custom_emoji_id = ? WHERE manager_id = ?', (custom_emoji_id, manager_id))
     conn.commit()
 
 
@@ -889,3 +944,72 @@ def is_on_vacation(conn, manager_username):
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM manager_substitutions WHERE original_manager = ?', (manager_username,))
     return cursor.fetchone()[0] > 0
+
+
+# === Файлы и шаблоны ===
+
+def save_file_template(conn, name, channel_message_id, template_text=None, file_type=None, uploaded_by=None):
+    """Сохранить или обновить файл-шаблон"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+
+    # Проверяем существует ли файл с таким именем
+    cursor.execute('SELECT id FROM file_templates WHERE name = ?', (name,))
+    existing = cursor.fetchone()
+
+    if existing:
+        # Обновляем
+        cursor.execute('''
+        UPDATE file_templates
+        SET channel_message_id = ?, template_text = ?, file_type = ?, updated_at = ?
+        WHERE name = ?
+        ''', (channel_message_id, template_text, file_type, current_time, name))
+    else:
+        # Создаём новый
+        cursor.execute('''
+        INSERT INTO file_templates (name, channel_message_id, template_text, file_type, uploaded_by, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, channel_message_id, template_text, file_type, uploaded_by, current_time))
+
+    conn.commit()
+    return existing is not None  # True если обновлён, False если создан
+
+
+def get_file_template(conn, name):
+    """Получить файл-шаблон по имени"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT name, channel_message_id, template_text, file_type, uploaded_by, uploaded_at
+    FROM file_templates WHERE name = ?
+    ''', (name,))
+    return cursor.fetchone()
+
+
+def list_file_templates(conn):
+    """Получить список всех файлов-шаблонов"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT name, template_text, file_type, uploaded_at
+    FROM file_templates ORDER BY name
+    ''')
+    return cursor.fetchall()
+
+
+def delete_file_template(conn, name):
+    """Удалить файл-шаблон"""
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM file_templates WHERE name = ?', (name,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def update_template_text(conn, name, template_text):
+    """Обновить текст шаблона"""
+    cursor = conn.cursor()
+    current_time = datetime.datetime.now()
+    cursor.execute('''
+    UPDATE file_templates SET template_text = ?, updated_at = ?
+    WHERE name = ?
+    ''', (template_text, current_time, name))
+    conn.commit()
+    return cursor.rowcount > 0
