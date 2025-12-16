@@ -1,10 +1,49 @@
 # CFRD Support Bot v2 - Заметки для сессий
 
-## Текущий статус (2025-12-13)
+## Как вернуться в следующей сессии
 
-**Бот работает!** Тестовая версия запущена с Pyrofork.
+```
+продолжаем support bot
+```
+
+---
+
+## Текущий статус (2025-12-16)
+
+**Бот работает в PRODUCTION!** Через systemd сервис `cfrd-support-bot-v2.service`
 
 **GitHub:** https://github.com/dscfrd/cfrd-support-bot-v2
+
+### Команды управления
+```bash
+# Статус
+systemctl status cfrd-support-bot-v2
+
+# Логи
+journalctl -u cfrd-support-bot-v2 -f
+
+# Перезапуск
+systemctl restart cfrd-support-bot-v2
+```
+
+---
+
+## Notion - Статьи для лендинга
+
+**Раздел:** Статья (ID: 2cbce2e0-0f4c-8050-98c7-fc089743cb6f)
+
+**Страницы:**
+- Описание системы для клиентов: https://notion.so/2cbce2e00f4c817ab973d465c226c177
+- Макет лендинга: https://notion.so/2cbce2e00f4c81898981ded8db2f8ff0
+
+**5 ключевых болей → решений:**
+1. CRM сложно → Всё в Telegram
+2. Не видно переписки → Группа с тредами
+3. Клиенты ждут → Автоуведомления
+4. Менеджер ушёл → История остаётся, смена одной командой
+5. Бот безликий → Имя + фото + должность в каждом сообщении
+
+---
 
 ## Структура проекта
 
@@ -638,6 +677,128 @@ async def command_router(client, message):
 ## ГОТОВО (обновлено 2025-12-15)
 
 - ✅ Исправлены команды /team и /help для владельца бизнес-аккаунта
+
+---
+
+## Изменения сессии 2025-12-16
+
+### Команда /newclient (NEW!)
+
+Создание треда для нового клиента по username:
+```
+/newclient @username
+```
+
+**Особенности:**
+- Работает **только в General** (не в тредах)
+- Получает информацию о пользователе по username
+- Проверяет, есть ли клиент уже в системе
+- Создаёт тред и сохраняет клиента в БД
+- После создания менеджер может писать клиенту через `/{thread_id} текст`
+
+**Ограничение Telegram:**
+Бизнес-аккаунт может писать первым только тем, кто **уже писал этому аккаунту раньше**. Если клиент никогда не писал — сообщение может не дойти.
+
+**Технические изменения:**
+- `bot.py`: добавлена функция `handle_newclient_command()`
+- `bot.py`: добавлен роут в `command_router`
+- `bot.py`: обновлён `/help` с новой командой
+
+---
+
+## ГОТОВО (обновлено 2025-12-16)
+
+- ✅ /newclient @username - создание треда для нового клиента
+
+---
+
+## Изменения сессии 2025-12-16 (вечер)
+
+### Исправлена отправка медиа-групп от менеджера клиенту
+
+**Проблема 1:** При отправке нескольких фото с `/thread_id` или `/custom_id` клиенту приходило только одно фото.
+
+**Причина:** Telegram отправляет media_group (альбом) как несколько отдельных сообщений с одинаковым `media_group_id`. Только первое сообщение имеет caption. Иногда фото без caption приходит РАНЬШЕ фото с caption, и группа ещё не создана.
+
+**Решение:**
+1. Создана система "ожидающих" групп (`pending_key = f"{media_group_id}_pending"`)
+2. Когда фото без caption приходит первым — создаётся ожидающая группа
+3. Когда приходит фото с caption — ожидающая группа объединяется с основной
+
+**Изменения в `bot.py`:**
+```python
+async def handle_manager_media_continuation(client, message):
+    # Если группа не найдена — создаём "ожидающую"
+    pending_key = f"{media_group_id}_pending"
+    if pending_key not in manager_media_groups:
+        manager_media_groups[pending_key] = {
+            "messages": [],
+            "pending": True,
+            ...
+        }
+
+async def handle_manager_media_group(client, message, thread_id, client_id):
+    # Проверяем ожидающую группу и объединяем
+    pending_key = f"{media_group_id}_pending"
+    if pending_key in manager_media_groups:
+        pending_messages = manager_media_groups[pending_key]["messages"]
+        del manager_media_groups[pending_key]
+```
+
+---
+
+**Проблема 2:** Медиа с custom_id (`/дс00`) не отправлялись клиенту.
+
+**Причина:**
+1. Фильтр `media_group_no_command_filter` использовал `not re.match(r"^/\d+", caption)` — пропускал только числовые команды
+2. `/дс00` не матчился как команда и попадал в `handle_manager_media_continuation`, который не знал что с ним делать
+
+**Решение:**
+1. Изменён фильтр на `not caption.startswith("/")` — теперь НЕ ловит любые команды
+2. Добавлен `handle_media_with_custom_id` для обработки медиа с custom_id в caption
+3. В `handle_manager_photo` добавлен прямой вызов `handle_media_with_custom_id` когда caption начинается с `/` и второй символ НЕ цифра
+
+---
+
+**Проблема 3:** В сообщении клиенту отображался custom_id (`/дс00`).
+
+**Решение:** В `send_manager_media_group_to_client` изменена логика удаления команды:
+```python
+# Было (только числовые):
+if parts and parts[0].startswith("/") and parts[0][1:].isdigit():
+
+# Стало (любые команды):
+if parts and parts[0].startswith("/"):
+```
+
+---
+
+**Проблема 4:** Подпись приходила ДО фото (хотели наоборот).
+
+**Решение:** Изменён порядок в `send_manager_media_group_to_client`:
+```python
+# Было:
+await client.send_message(...)  # подпись
+await client.send_media_group(...)  # фото
+
+# Стало:
+await client.send_media_group(...)  # фото
+await client.send_message(...)  # подпись
+```
+
+---
+
+### Технические изменения
+
+**bot.py:**
+- `handle_manager_media_continuation` — добавлена логика pending групп
+- `handle_manager_media_group` — объединение с pending группами, флаг `task_started`
+- `send_manager_media_group_to_client` — удаление любых команд, порядок фото→подпись
+- `handle_media_with_custom_id` — новая функция для медиа с `/дс00`
+- `media_group_no_command_filter` — изменён на `not caption.startswith("/")`
+- `handle_manager_photo` — прямой вызов `handle_media_with_custom_id`
+
+**Коммит:** `b23f996 Fix media groups: pending photos, custom_id support, photos-first order`
 
 ---
 
