@@ -1,4 +1,4 @@
-from pyrogram import Client, filters
+from pyrogram import Client, filters, ContinuePropagation
 from pyrogram.handlers import RawUpdateHandler
 from pyrogram.types import MessageEntity
 from pyrogram.enums import MessageEntityType
@@ -103,25 +103,85 @@ update_message_text = db.update_message_text
 
 # === ЦЕНТРАЛЬНЫЙ РОУТЕР КОМАНД ДЛЯ ГРУППЫ ПОДДЕРЖКИ ===
 # Из-за бага в pyrofork, фильтры filters.command() и filters.regex() не работают
-# для outgoing сообщений (от аккаунта бота). Поэтому используем роутер для outgoing.
+# ни для outgoing, ни для incoming сообщений в группах. Поэтому используем роутер для всех.
+
+def _cmd_match(text, cmd):
+    """Проверяет, начинается ли текст с команды /cmd"""
+    if not text.startswith(f'/{cmd}'):
+        return False
+    # После команды должен быть конец строки или пробел
+    rest = text[len(cmd) + 1:]
+    return len(rest) == 0 or rest[0].isspace()
+
 @business.on_message(filters.chat(SUPPORT_GROUP_ID), group=-10)
 async def command_router(client, message):
-    """Центральный роутер команд для группы поддержки (только outgoing)"""
-    # Обрабатываем только исходящие сообщения (от аккаунта бота)
-    # Входящие сообщения (от других менеджеров) обрабатываются стандартными хэндлерами
-    if not message.outgoing:
-        return
+    """Центральный роутер команд для группы поддержки (outgoing и incoming)"""
+    # DEBUG: логируем ВСЕ сообщения
+    logger.info(f"[ROUTER-DEBUG] Получено сообщение: text={message.text[:30] if message.text else None}, caption={message.caption[:30] if message.caption else None}, photo={bool(message.photo)}")
 
     if not message.text:
-        return
+        raise ContinuePropagation
 
     text = message.text.strip()
 
-    # Роутинг команд для outgoing сообщений
-    if text.startswith('/team') and (len(text) == 5 or text[5].isspace()):
+    # Не логируем каждое сообщение, только команды
+    if not text.startswith('/'):
+        raise ContinuePropagation
+
+    logger.info(f"[ROUTER] Команда: {text[:50]}, outgoing={message.outgoing}")
+
+    # Роутинг команд (для outgoing и incoming)
+    # Команды с реализацией в роутере
+    if _cmd_match(text, 'team'):
         await _handle_team_command(client, message)
-    elif text.startswith('/help') and (len(text) == 5 or text[5].isspace()):
+    elif _cmd_match(text, 'help'):
         await _handle_help_command(client, message)
+    elif _cmd_match(text, 'ok'):
+        await _handle_ok_command(client, message)
+    # Команды с существующими обработчиками - вызываем напрямую
+    elif _cmd_match(text, 'groups'):
+        await handle_list_groups(client, message)
+    elif _cmd_match(text, 'onduty'):
+        await handle_assign_duty(client, message)
+    elif _cmd_match(text, 'auth'):
+        await handle_auth(client, message)
+    elif _cmd_match(text, 'myinfo'):
+        await handle_myinfo(client, message)
+    elif _cmd_match(text, 'card'):
+        await handle_send_card(client, message)
+    elif _cmd_match(text, 'id'):
+        await handle_set_custom_id(client, message)
+    elif _cmd_match(text, 'company'):
+        await handle_set_company(client, message)
+    elif _cmd_match(text, 'upload'):
+        await handle_upload_file(client, message)
+    elif _cmd_match(text, 'file'):
+        await handle_send_file(client, message)
+    elif _cmd_match(text, 'files'):
+        await handle_list_files(client, message)
+    elif _cmd_match(text, 'temp'):
+        await handle_send_template(client, message)
+    elif _cmd_match(text, 'threads'):
+        await handle_list_threads(client, message)
+    elif _cmd_match(text, 'del') and message.reply_to_message:
+        await handle_delete_message(client, message)
+    elif _cmd_match(text, 'duties'):
+        await handle_duties_command(client, message)
+    elif _cmd_match(text, 'tier'):
+        await handle_tier_command(client, message)
+    elif _cmd_match(text, 'vacation'):
+        await handle_vacation_command(client, message)
+    elif _cmd_match(text, 'return'):
+        await handle_return_command(client, message)
+    elif _cmd_match(text, 'fire'):
+        await handle_fire_command(client, message)
+    elif _cmd_match(text, 'readme'):
+        await handle_readme_command(client, message)
+    elif _cmd_match(text, 'newclient'):
+        await handle_newclient_command(client, message)
+    else:
+        # Пропускаем дальше для других обработчиков (например, ответы по thread_id)
+        raise ContinuePropagation
 
 
 # Реализации команд для роутера
@@ -195,6 +255,7 @@ async def _handle_help_command(client, message):
 
 ⚙️ **Управление**:
 - `/auth [эмодзи], [Имя], [Должность]` - Авторизоваться
+- `/newclient @username` - Создать тред для нового клиента (только в General)
 - `/onduty @username [ID_треда]` - Назначить ответственного
 - `/ok [ID_треда]` - Сбросить уведомления для треда
 - `/duties` - Список ответственных менеджеров
@@ -209,9 +270,7 @@ async def _handle_help_command(client, message):
 
 📊 **Информация**:
 - `/myinfo` - Ваша информация в системе
-- `/group_info [ID_треда]` - Информация о группе
 - `/help` - Краткая справка
-- `/readme` - Скачать полное руководство
 
 ℹ️ **Подсказки**:
 - ID клиента: русские буквы и цифры (например: Иванов, Клиент123)
@@ -226,6 +285,60 @@ async def _handle_help_command(client, message):
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
+async def _handle_ok_command(client, message):
+    """Сбросить уведомление для треда (роутер для outgoing)"""
+    try:
+        manager_id = message.from_user.id
+
+        # Проверяем, авторизован ли менеджер
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text(
+                "Вы не авторизованы в системе. Пожалуйста, используйте команду /auth для авторизации."
+            )
+            return
+
+        # Парсим команду: /ok {thread_id}
+        command_text = message.text.strip()
+        parts = command_text.split()
+
+        if len(parts) != 2:
+            await message.reply_text(
+                "Неверный формат команды. Используйте: /ok {thread_id}"
+            )
+            return
+
+        try:
+            thread_id = int(parts[1])
+        except ValueError:
+            await message.reply_text("ID треда должен быть числом.")
+            return
+
+        # Проверяем, существует ли тред
+        cursor = db_connection.cursor()
+        cursor.execute('SELECT thread_id FROM clients WHERE thread_id = ? UNION SELECT thread_id FROM group_threads WHERE thread_id = ?',
+                      (thread_id, thread_id))
+        thread_exists = cursor.fetchone()
+
+        if not thread_exists:
+            await message.reply_text(f"Тред #{thread_id} не найден.")
+            return
+
+        # Сбрасываем уведомление
+        reset_thread_notification(db_connection, thread_id)
+
+        # Меняем иконку треда
+        try:
+            await mark_thread_urgent(client, thread_id, is_urgent=False)
+        except Exception as e:
+            logger.error(f"Ошибка при изменении иконки треда {thread_id}: {e}")
+
+        await message.reply_text(f"✅ Уведомление для треда #{thread_id} сброшено.")
+        logger.info(f"Уведомление для треда {thread_id} сброшено менеджером {manager_id} (outgoing)")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке команды /ok (outgoing): {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
 
 
 # === ФУНКЦИИ ДЛЯ КАСТОМ ЭМОДЗИ ===
@@ -1116,12 +1229,13 @@ async def send_manager_media_group_to_client(client, manager_id, client_id, medi
         _, emoji, name, position, extension, photo_file_id, auth_date, username, *_ = manager
         signature = f"\n—\n`{emoji} {name}, {position}`"
 
-        # Получаем caption и удаляем команду /номер из начала
+        # Получаем caption и удаляем команду из начала (/105 или /дс00)
         caption = media_group_data.get("caption", "")
         if caption:
-            # Удаляем команду /номер из начала подписи
+            # Удаляем команду из начала подписи (числовую или custom_id)
             parts = caption.split(None, 1)  # разбиваем по первому пробелу
-            if parts and parts[0].startswith("/") and parts[0][1:].isdigit():
+            if parts and parts[0].startswith("/"):
+                # Удаляем любую команду (/105 или /дс00)
                 caption = parts[1] if len(parts) > 1 else ""
         full_caption = f"{caption}{signature}" if caption else signature.lstrip("\n—\n`").rstrip("`")
 
@@ -1139,13 +1253,13 @@ async def send_manager_media_group_to_client(client, manager_id, client_id, medi
             logger.error(f"Нет медиафайлов для отправки клиенту {client_id}")
             return False
 
-        # Сначала подпись, потом файлы
-        await client.send_message(chat_id=client_id, text=full_caption, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
+        # Сначала фото, потом подпись
         try:
             await client.send_media_group(chat_id=client_id, media=media_group)
         except TypeError as e:
             if "topics" not in str(e):
                 raise
+        await client.send_message(chat_id=client_id, text=full_caption, parse_mode=pyrogram.enums.ParseMode.MARKDOWN)
         logger.info(f"Медиа-группа от менеджера отправлена клиенту {client_id}")
 
         save_message(db_connection, client_id, f"{caption or '[Медиафайлы]'}{signature}", is_from_user=False, media_type="MEDIA_GROUP")
@@ -1299,15 +1413,25 @@ async def handle_manager_media_group(client, message, thread_id, client_id):
     manager_id = message.from_user.id
     group_key = f"{media_group_id}_{thread_id}_{manager_id}"
 
-    if group_key not in manager_media_groups:
+    # Проверяем, есть ли ожидающая группа (фото без caption пришли раньше)
+    pending_key = f"{media_group_id}_pending"
+    pending_messages = []
+    if pending_key in manager_media_groups:
+        pending_messages = manager_media_groups[pending_key]["messages"]
+        del manager_media_groups[pending_key]
+        logger.info(f"Найдена ожидающая группа {pending_key} с {len(pending_messages)} фото")
+
+    is_new_group = group_key not in manager_media_groups
+    if is_new_group:
         manager_media_groups[group_key] = {
-            "messages": [],
+            "messages": pending_messages,  # Добавляем ранее пришедшие фото
             "manager_id": manager_id,
             "thread_id": thread_id,
             "client_id": client_id,
             "caption": message.caption or "",
             "timestamp": datetime.datetime.now(),
-            "processed": False
+            "processed": False,
+            "task_started": False
         }
         logger.info(f"Создана новая запись для медиа-группы менеджера {group_key}")
 
@@ -1317,7 +1441,9 @@ async def handle_manager_media_group(client, message, thread_id, client_id):
 
     logger.info(f"Добавлено сообщение в медиа-группу менеджера {group_key}, всего: {len(manager_media_groups[group_key]['messages'])}")
 
-    if len(manager_media_groups[group_key]["messages"]) == 1:
+    # Запускаем таймер только один раз при создании группы
+    if is_new_group and not manager_media_groups[group_key].get("task_started"):
+        manager_media_groups[group_key]["task_started"] = True
         async def process_manager_group():
             await asyncio.sleep(2)
 
@@ -1347,6 +1473,45 @@ async def handle_manager_media_group(client, message, thread_id, client_id):
         asyncio.create_task(process_manager_group())
 
     return True
+
+
+async def handle_manager_media_continuation(client, message):
+    """
+    Обрабатывает дополнительные фото в media_group от менеджера (без caption).
+    Ищет существующую группу по media_group_id и добавляет в неё.
+    Если группа ещё не создана - создаёт "ожидающую" запись.
+    """
+    global manager_media_groups
+
+    if not message.media_group_id:
+        return False
+
+    media_group_id = message.media_group_id
+
+    # Ищем существующую группу для этого media_group_id
+    for group_key, group_data in manager_media_groups.items():
+        if group_key.startswith(f"{media_group_id}_") and not group_data["processed"]:
+            # Нашли группу - добавляем сообщение
+            group_data["messages"].append(message)
+            logger.info(f"Добавлено фото в медиа-группу менеджера {group_key}, всего: {len(group_data['messages'])}")
+            return True
+
+    # Группа ещё не создана - создаём "ожидающую" запись
+    # Ключ временный, будет обновлён когда придёт сообщение с caption
+    pending_key = f"{media_group_id}_pending"
+    if pending_key not in manager_media_groups:
+        manager_media_groups[pending_key] = {
+            "messages": [],
+            "pending": True,
+            "timestamp": datetime.datetime.now(),
+            "processed": False
+        }
+        logger.info(f"Создана ожидающая медиа-группа {pending_key}")
+
+    manager_media_groups[pending_key]["messages"].append(message)
+    logger.info(f"Добавлено фото в ожидающую медиа-группу {pending_key}, всего: {len(manager_media_groups[pending_key]['messages'])}")
+    return True
+
 
 # Алиас для reset_thread_notification (используется локально)
 def reset_thread_notification(conn, thread_id):
@@ -2010,6 +2175,9 @@ async def handle_media_with_thread_command(client, message):
             return
         manager_id = message.from_user.id
 
+        # DEBUG: проверяем media_group_id
+        logger.info(f"[DEBUG] handle_media_with_thread_command: media_group_id={message.media_group_id}, caption={message.caption[:30] if message.caption else None}")
+
         # Извлекаем номер треда из caption
         caption_text = message.caption or ""
         if not caption_text:
@@ -2023,14 +2191,27 @@ async def handle_media_with_thread_command(client, message):
 
         # Получаем клиента
         client_data = get_client_by_thread(db_connection, thread_id)
+        actual_thread_id = thread_id
+
         if not client_data:
-            await message.reply_text(f"Клиент для треда {thread_id} не найден.")
-            return
-        client_id = client_data[0]
+            # Fallback: пробуем найти по user_id
+            cursor = db_connection.cursor()
+            cursor.execute('SELECT thread_id FROM clients WHERE user_id = ?', (thread_id,))
+            client_by_user_id = cursor.fetchone()
+
+            if client_by_user_id:
+                actual_thread_id = client_by_user_id[0]
+                client_id = thread_id  # thread_id на самом деле был user_id
+                logger.info(f"Fallback медиа: найден клиент {client_id} по user_id, thread_id={actual_thread_id}")
+            else:
+                await message.reply_text(f"Клиент для /{thread_id} не найден.\nИспользуйте номер треда или ID клиента.")
+                return
+        else:
+            client_id = client_data[0]
 
         # Если это медиа-группа - обрабатываем отдельно
         if message.media_group_id:
-            await handle_manager_media_group(client, message, thread_id, client_id)
+            await handle_manager_media_group(client, message, actual_thread_id, client_id)
             return
 
         # Проверяем авторизацию
@@ -2071,21 +2252,21 @@ async def handle_media_with_thread_command(client, message):
         
         if success:
             # Обновляем время последнего ответа менеджера
-            update_manager_reply_time(db_connection, thread_id)
-            
+            update_manager_reply_time(db_connection, actual_thread_id)
+
             # Пытаемся убрать индикатор срочности из заголовка треда
             try:
-                await mark_thread_urgent(client, thread_id, is_urgent=False)
+                await mark_thread_urgent(client, actual_thread_id, is_urgent=False)
             except Exception as e:
-                logger.error(f"Ошибка при изменении визуального индикатора треда {thread_id}: {e}")
-            
+                logger.error(f"Ошибка при изменении визуального индикатора треда {actual_thread_id}: {e}")
+
             # Не отправляем подтверждение в группу, только записываем в лог
             logger.info(f"Медиафайл от менеджера {manager_id} отправлен клиенту {client_id}, статус треда обновлен")
-            
+
             # Сохраняем информацию о первом ответе менеджера, если это первый ответ
-            if is_first_reply(db_connection, thread_id, manager_id):
-                save_first_reply(db_connection, thread_id, client_id, manager_id)
-                logger.info(f"Сохранена информация о первом ответе менеджера {manager_id} для треда {thread_id}")
+            if is_first_reply(db_connection, actual_thread_id, manager_id):
+                save_first_reply(db_connection, actual_thread_id, client_id, manager_id)
+                logger.info(f"Сохранена информация о первом ответе менеджера {manager_id} для треда {actual_thread_id}")
         else:
             # Только в случае ошибки уведомляем менеджера
             await message.reply_text(
@@ -2095,7 +2276,25 @@ async def handle_media_with_thread_command(client, message):
     except Exception as e:
         logger.error(f"Ошибка при обработке медиафайла с командой: {e}")
         await message.reply_text(f"Произошла ошибка: {e}")
-        
+
+
+# Кастомный фильтр для дополнительных фото в media_group (без команды в caption)
+async def media_group_no_command_filter(_, __, message):
+    if not message.media_group_id:
+        return False
+    caption = message.caption or ""
+    # НЕ ловим сообщения с ЛЮБЫМИ командами (включая /дс00)
+    # Этот фильтр только для дополнительных фото БЕЗ caption
+    return not caption.startswith("/")
+
+
+# Обработчик дополнительных фото в media_group (без caption с командой)
+@business.on_message(filters.create(media_group_no_command_filter) & filters.chat(SUPPORT_GROUP_ID) & (filters.photo | filters.document | filters.video | filters.audio | filters.voice))
+async def handle_media_group_continuation(client, message):
+    """Добавляет дополнительные фото в существующую media_group"""
+    await handle_manager_media_continuation(client, message)
+
+
 # Обновляем обработчик ответов менеджеров, чтобы они могли отвечать в группы
 @business.on_message(filters.regex(r"^/reply_\d+") & filters.chat(SUPPORT_GROUP_ID))
 async def handle_reply_to_group(client, message):
@@ -2344,6 +2543,17 @@ async def handle_auth(client, message):
 @business.on_message(filters.photo & filters.chat(SUPPORT_GROUP_ID))
 async def handle_manager_photo(client, message):
     try:
+        logger.info(f"[DEBUG] handle_manager_photo: media_group_id={message.media_group_id}, caption={message.caption[:20] if message.caption else None}")
+
+        # Пропускаем фото с командой в caption (обрабатывается другими handlers)
+        caption = message.caption or ""
+        if caption.startswith("/"):
+            # Если это custom_id (не число) - вызываем handler напрямую
+            if len(caption) > 1 and not caption[1:2].isdigit():
+                await handle_media_with_custom_id(client, message)
+            # Для числовых команд - просто пропускаем (handle_media_with_thread_command сработает)
+            return
+
         # Если это часть медиа-группы - проверяем, есть ли уже запись
         if message.media_group_id:
             manager_id = message.from_user.id if message.from_user else 0
@@ -2571,6 +2781,91 @@ async def handle_custom_id_command(client, message):
         logger.error(f"Ошибка при обработке команды /ID: {e}")
         await message.reply_text(f"Ошибка: {e}")
 
+
+# Кастомный фильтр для медиа с custom_id в caption (русские буквы)
+async def custom_id_caption_filter(_, __, message):
+    caption = message.caption or ""
+    import re
+    result = bool(re.match(r"^/[А-Яа-яA-Za-z][А-Яа-яA-Za-z0-9]*", caption))
+    if caption.startswith("/") and not caption[1:2].isdigit():
+        logger.info(f"[DEBUG] custom_id_caption_filter: caption={caption}, result={result}")
+    return result
+
+
+# Обработчик медиафайлов с Custom ID в подписи (/дс00)
+@business.on_message(filters.create(custom_id_caption_filter) & filters.chat(SUPPORT_GROUP_ID) & (filters.photo | filters.document | filters.video | filters.audio | filters.voice))
+async def handle_media_with_custom_id(client, message):
+    """Обработчик медиа с Custom ID клиента в caption (/Иванов)"""
+    try:
+        if not message.from_user:
+            return
+        manager_id = message.from_user.id
+
+        caption_text = message.caption or ""
+        parts = caption_text.split(maxsplit=1)
+        custom_id = parts[0][1:]  # Убираем "/"
+
+        logger.info(f"[DEBUG] handle_media_with_custom_id: custom_id={custom_id}, media_group_id={message.media_group_id}")
+
+        # Проверяем авторизацию
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы. Используйте /auth")
+            return
+
+        # Получаем thread_id и client_id по custom_id
+        thread_id, client_id = get_thread_id_by_custom_id(db_connection, custom_id)
+
+        if not thread_id or not client_id:
+            await message.reply_text(f"❌ Клиент с ID #{custom_id} не найден")
+            return
+
+        # Если это медиа-группа - обрабатываем отдельно
+        if message.media_group_id:
+            await handle_manager_media_group(client, message, thread_id, client_id)
+            return
+
+        # Парсим текст подписи (после custom_id)
+        caption = parts[1] if len(parts) > 1 else None
+
+        # Определяем тип медиафайла
+        file_id = None
+        media_type = None
+
+        if message.photo:
+            file_id = message.photo.file_id
+            media_type = "photo"
+        elif message.document:
+            file_id = message.document.file_id
+            media_type = "document"
+        elif message.video:
+            file_id = message.video.file_id
+            media_type = "video"
+        elif message.audio:
+            file_id = message.audio.file_id
+            media_type = "audio"
+        elif message.voice:
+            file_id = message.voice.file_id
+            media_type = "voice"
+
+        # Отправляем медиафайл клиенту
+        success = await send_manager_media_to_client(client, manager_id, client_id, file_id, caption, media_type)
+
+        if success:
+            update_manager_reply_time(db_connection, thread_id)
+            try:
+                await mark_thread_urgent(client, thread_id, is_urgent=False)
+            except Exception as e:
+                logger.error(f"Ошибка при изменении индикатора треда {thread_id}: {e}")
+            logger.info(f"Медиафайл по /{custom_id} отправлен клиенту {client_id}")
+        else:
+            await message.reply_text("❌ Не удалось отправить медиафайл клиенту.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке медиа с custom_id: {e}")
+        await message.reply_text(f"Ошибка: {e}")
+
+
 # Обработчик команды ответа менеджера клиенту - команд вида /{num}, где num - номер треда
 @business.on_message(filters.regex(r"^/\d+") & filters.chat(SUPPORT_GROUP_ID))
 async def handle_thread_number_command(client, message):
@@ -2715,9 +3010,37 @@ async def handle_thread_number_command(client, message):
                     logger.error(f"Ошибка при отправке сообщения в группу {group_id}: {e}")
                     await message.reply_text(f"❌ Ошибка при отправке сообщения в группу: {e}")
             else:
-                await message.reply_text(
-                    f"Не удалось найти клиента или группу для треда {thread_id}."
-                )
+                # Fallback: пробуем найти клиента по user_id (если ввели client_id вместо thread_id)
+                cursor.execute('SELECT thread_id FROM clients WHERE user_id = ?', (thread_id,))
+                client_by_user_id = cursor.fetchone()
+
+                if client_by_user_id:
+                    # Нашли клиента по user_id - используем его thread_id
+                    actual_thread_id = client_by_user_id[0]
+                    client_id = thread_id  # thread_id на самом деле был user_id
+
+                    logger.info(f"Fallback: найден клиент {client_id} по user_id, thread_id={actual_thread_id}")
+
+                    success = await send_manager_reply_to_client(
+                        client, manager_id, client_id, reply_text,
+                        group_message_id=message.id,
+                        thread_id=actual_thread_id
+                    )
+
+                    if success:
+                        update_manager_reply_time(db_connection, actual_thread_id)
+                        try:
+                            await mark_thread_urgent(client, actual_thread_id, is_urgent=False)
+                        except Exception as e:
+                            logger.error(f"Ошибка при изменении индикатора треда {actual_thread_id}: {e}")
+                        logger.info(f"Ответ менеджера {manager_id} отправлен клиенту {client_id} (по user_id)")
+                    else:
+                        await message.reply_text("❌ Не удалось отправить ответ клиенту.")
+                else:
+                    await message.reply_text(
+                        f"Не удалось найти клиента или группу для /{thread_id}.\n"
+                        f"Используйте номер треда (маленькое число) или ID клиента."
+                    )
     except ValueError:
         # Если номер треда не удалось преобразовать в число
         logger.error(f"Некорректный формат команды: {message.text}")
@@ -3531,7 +3854,8 @@ async def handle_delete_message(client, message):
 
 
 # Обработчик команды /ok для сброса текущего уведомления
-@business.on_message(filters.command("ok") & filters.chat(SUPPORT_GROUP_ID))
+# Используем regex вместо command, т.к. command требует entity bot_command от Telegram
+@business.on_message(filters.regex(r'^/ok(\s|$)') & filters.chat(SUPPORT_GROUP_ID) & ~filters.outgoing)
 async def handle_ok_command(client, message):
     try:
         manager_id = message.from_user.id
@@ -4109,6 +4433,115 @@ async def handle_fire_command(client, message):
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
+# Команда /newclient - создать тред для нового клиента по username
+@business.on_message(filters.command("newclient") & filters.chat(SUPPORT_GROUP_ID))
+async def handle_newclient_command(client, message):
+    """
+    Создать тред для нового клиента по username.
+    Использование: /newclient @username (только в general)
+    """
+    try:
+        # Проверяем что команда вызвана в general (не в треде)
+        if message.message_thread_id:
+            await message.reply_text(
+                "❌ Команда `/newclient` работает только в **General**.\n"
+                "Выйдите из треда и отправьте команду снова."
+            )
+            return
+
+        # Проверяем авторизацию менеджера
+        if not message.from_user:
+            await message.reply_text("❌ Невозможно определить отправителя.")
+            return
+
+        manager_id = message.from_user.id
+        manager = get_manager(db_connection, manager_id)
+        if not manager:
+            await message.reply_text("Вы не авторизованы. Используйте /auth")
+            return
+
+        # Парсим username
+        args = message.text.split()[1:]
+        if not args:
+            await message.reply_text(
+                "**Использование:**\n"
+                "`/newclient @username`\n\n"
+                "Создаёт тред для клиента. После создания можно писать клиенту через `/[thread_id] текст`"
+            )
+            return
+
+        username = args[0].lstrip('@')
+        if not username:
+            await message.reply_text("❌ Укажите username клиента")
+            return
+
+        # Получаем информацию о пользователе
+        try:
+            user = await client.get_users(username)
+        except Exception as e:
+            logger.error(f"Ошибка при получении пользователя @{username}: {e}")
+            await message.reply_text(
+                f"❌ Не удалось найти пользователя @{username}\n\n"
+                "Возможные причины:\n"
+                "- Неверный username\n"
+                "- Пользователь никогда не писал боту"
+            )
+            return
+
+        # Проверяем, есть ли уже клиент в БД
+        cursor = db_connection.cursor()
+        cursor.execute('SELECT thread_id FROM clients WHERE user_id = ?', (user.id,))
+        existing = cursor.fetchone()
+
+        if existing and existing[0]:
+            await message.reply_text(
+                f"ℹ️ Клиент **{user.first_name}** (@{user.username}) уже есть в системе.\n"
+                f"Тред: **#{existing[0]}**"
+            )
+            return
+
+        # Создаём тред для клиента
+        await message.reply_text(f"⏳ Создаю тред для @{username}...")
+
+        thread_id = await create_thread_for_client(client, user)
+
+        if not thread_id:
+            await message.reply_text("❌ Не удалось создать тред. Проверьте логи.")
+            return
+
+        # Сохраняем/обновляем клиента в БД
+        if existing:
+            # Клиент есть, но без треда - обновляем
+            update_client_thread(db_connection, user.id, thread_id)
+        else:
+            # Новый клиент - создаём запись
+            cursor.execute('''
+                INSERT INTO clients (user_id, first_name, last_name, username, first_contact, last_contact, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user.id, user.first_name, user.last_name, user.username,
+                  datetime.datetime.now(), datetime.datetime.now(), thread_id))
+            db_connection.commit()
+
+        client_name = f"{user.first_name}"
+        if user.last_name:
+            client_name += f" {user.last_name}"
+
+        await message.reply_text(
+            f"✅ **Тред создан!**\n\n"
+            f"**Клиент:** {client_name} (@{user.username})\n"
+            f"**ID клиента:** `{user.id}`\n"
+            f"**Тред:** **#{thread_id}**\n\n"
+            f"Чтобы написать клиенту:\n"
+            f"`/{thread_id} Ваше сообщение`"
+        )
+
+        logger.info(f"Создан тред #{thread_id} для @{username} (ID: {user.id}) менеджером {manager_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании клиента: {e}")
+        await message.reply_text(f"Произошла ошибка: {e}")
+
+
 # функция планировщика проверок
 async def schedule_checks():
     # Начальная задержка для полной инициализации клиента
@@ -4191,7 +4624,8 @@ async def handle_create_test_topic(client, message):
 
 # Обработчик команды помощи (для входящих сообщений от других менеджеров)
 # Outgoing сообщения обрабатываются роутером command_router
-@business.on_message(filters.command("help") & filters.chat(SUPPORT_GROUP_ID))
+# Используем regex вместо command, т.к. command требует entity bot_command от Telegram
+@business.on_message(filters.regex(r'^/help(\s|$)') & filters.chat(SUPPORT_GROUP_ID) & ~filters.outgoing)
 async def handle_help_command(client, message):
     try:
         logger.info(f"Получена команда /help от пользователя {message.from_user.id}")
@@ -4208,6 +4642,7 @@ async def handle_help_command(client, message):
 
 ⚙️ **Управление**:
 - `/auth [эмодзи], [Имя], [Должность]` - Авторизоваться
+- `/newclient @username` - Создать тред для нового клиента (только в General)
 - `/onduty @username [ID_треда]` - Назначить ответственного
 - `/ok [ID_треда]` - Сбросить уведомления для треда
 - `/duties` - Список ответственных менеджеров
@@ -4222,9 +4657,7 @@ async def handle_help_command(client, message):
 
 📊 **Информация**:
 - `/myinfo` - Ваша информация в системе
-- `/group_info [ID_треда]` - Информация о группе
 - `/help` - Краткая справка
-- `/readme` - Скачать полное руководство
 
 ℹ️ **Подсказки**:
 - ID клиента: русские буквы и цифры (например: Иванов, Клиент123)
