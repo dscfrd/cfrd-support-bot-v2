@@ -976,6 +976,31 @@ MONITORING_ENABLED = True            # Вкл/выкл
 
 ---
 
+### Исправлено: блокировка сессии Pyrogram (database is locked)
+
+**Проблема:** Бот не работал, сообщения не доходили. В логах ошибка:
+```
+sqlite3.OperationalError: database is locked
+```
+
+**Причина:** Файл сессии Pyrogram (`business_account.session`) заблокирован предыдущим процессом или повреждён.
+
+**Решение:**
+1. Убить все процессы бота: `pkill -9 -f "cfrd-support-bot-v2.*bot.py"`
+2. Восстановить сессию из бэкапа:
+```bash
+rm -f business_account.session
+cp business_account.session.bak business_account.session
+```
+3. Перезапустить бот
+
+**Рекомендация:** Периодически делать бэкап сессии:
+```bash
+cp business_account.session business_account.session.bak
+```
+
+---
+
 ## Как продолжить работу
 
 Скажи Claude:
