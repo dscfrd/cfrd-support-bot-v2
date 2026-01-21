@@ -240,6 +240,44 @@ def update_client_thread(conn, user_id, thread_id):
     conn.commit()
 
 
+def archive_client(conn, thread_id):
+    """Архивировать клиента (удалить thread_id)
+
+    После архивации клиент не может писать — получит отбивку.
+
+    Returns:
+        dict с данными клиента или None если не найден
+    """
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, first_name, last_name, custom_id FROM clients WHERE thread_id = ?', (thread_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    client_data = {
+        'user_id': row[0],
+        'first_name': row[1],
+        'last_name': row[2],
+        'custom_id': row[3],
+    }
+
+    cursor.execute('UPDATE clients SET thread_id = NULL WHERE thread_id = ?', (thread_id,))
+    conn.commit()
+
+    return client_data
+
+
+def is_client_archived(conn, user_id):
+    """Проверить, архивирован ли клиент (существует, но без thread_id)"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT thread_id FROM clients WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return False  # Клиента нет в базе
+    return row[0] is None  # Есть в базе, но thread_id = NULL
+
+
 def get_client_by_thread(conn, thread_id):
     """Получить клиента по thread_id"""
     cursor = conn.cursor()
@@ -544,10 +582,14 @@ def update_client_message_time(conn, thread_id):
     cursor = conn.cursor()
     current_time = datetime.datetime.now()
 
+    # Используем INSERT ... ON CONFLICT чтобы не затирать last_manager_reply
     cursor.execute('''
-    INSERT OR REPLACE INTO thread_status (thread_id, last_client_message, is_notified, notification_disabled)
-    VALUES (?, ?, 0, COALESCE((SELECT notification_disabled FROM thread_status WHERE thread_id = ?), 0))
-    ''', (thread_id, current_time, thread_id))
+    INSERT INTO thread_status (thread_id, last_client_message, is_notified, notification_disabled)
+    VALUES (?, ?, 0, 0)
+    ON CONFLICT(thread_id) DO UPDATE SET
+        last_client_message = excluded.last_client_message,
+        is_notified = 0
+    ''', (thread_id, current_time))
 
     conn.commit()
 
@@ -1013,3 +1055,28 @@ def update_template_text(conn, name, template_text):
     ''', (template_text, current_time, name))
     conn.commit()
     return cursor.rowcount > 0
+
+
+# === Рассылка ===
+
+def get_all_clients_for_broadcast(conn):
+    """Получить всех клиентов для рассылки (владелец)"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT user_id, first_name, last_name, username, thread_id
+    FROM clients
+    WHERE thread_id IS NOT NULL
+    ''')
+    return cursor.fetchall()
+
+
+def get_manager_clients_for_broadcast(conn, manager_username):
+    """Получить клиентов менеджера для рассылки"""
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT c.user_id, c.first_name, c.last_name, c.username, c.thread_id
+    FROM clients c
+    INNER JOIN duty_managers dm ON c.thread_id = dm.thread_id
+    WHERE dm.manager_username = ?
+    ''', (manager_username,))
+    return cursor.fetchall()

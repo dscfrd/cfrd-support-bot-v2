@@ -43,7 +43,8 @@ from config import (
     EMOJI_PACK_NAME,
     URGENT_WAIT_TIME, FIRST_NOTIFICATION_DELAY,
     NOTIFICATION_INTERVAL, CHECK_INTERVAL,
-    PARSE_MODE, WORKERS
+    PARSE_MODE, WORKERS,
+    MONITORING_CHAT_ID, HEARTBEAT_INTERVAL, MONITORING_ENABLED
 )
 
 # Импорт функций БД
@@ -887,22 +888,22 @@ async def forward_message_to_support(client, message, thread_id=None):
                     media_info_html = f"\n+ {media_count} {media_label}" if media_type else ""
 
                     if message_content_html:
-                        full_message = f"{message_header_html}\n{reply_info}{message_content_html}{media_info_html}"
+                        full_message = f"{message_header_html}\n{reply_info}{message_content_html}{media_info_html}{manager_mention}"
                     else:
-                        full_message = f"{message_header_html}\n{reply_info}{media_info_html}"
+                        full_message = f"{message_header_html}\n{reply_info}{media_info_html}{manager_mention}"
                     parse_mode = pyrogram.enums.ParseMode.HTML
                 else:
                     # Markdown формат (стандартный)
                     if reply_info:
                         if message_content:
-                            full_message = f"{message_header}\n{reply_info}{message_content}{media_info}"
+                            full_message = f"{message_header}\n{reply_info}{message_content}{media_info}{manager_mention}"
                         else:
-                            full_message = f"{message_header}\n{reply_info}{media_info}"
+                            full_message = f"{message_header}\n{reply_info}{media_info}{manager_mention}"
                     else:
                         if message_content:
-                            full_message = f"{message_header}\n\n{message_content}{media_info}"
+                            full_message = f"{message_header}\n\n{message_content}{media_info}{manager_mention}"
                         else:
-                            full_message = f"{message_header}{media_info}"
+                            full_message = f"{message_header}{media_info}{manager_mention}"
                     parse_mode = pyrogram.enums.ParseMode.MARKDOWN
 
                 # Определяем на какое сообщение отвечать:
@@ -2415,8 +2416,8 @@ async def handle_list_groups(client, message):
         logger.error(f"Ошибка при получении списка групп: {e}")
         await message.reply_text(f"Произошла ошибка: {e}")
  
-# Команда для назначения ответсвенного       
-@business.on_message(filters.command("onduty") & filters.chat(SUPPORT_GROUP_ID))
+# Команда для назначения ответсвенного
+# Декоратор убран — команда обрабатывается через роутер (command_router)
 async def handle_assign_duty(client, message):
     try:
         assigner_id = message.from_user.id
@@ -4542,16 +4543,81 @@ async def handle_newclient_command(client, message):
         await message.reply_text(f"Произошла ошибка: {e}")
 
 
+# === Мониторинг и Heartbeat ===
+bot_start_time = None
+
+async def send_monitoring_message(msg_type: str):
+    """Отправить сообщение мониторинга в группу"""
+    if not MONITORING_ENABLED:
+        return
+
+    try:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if msg_type == "start":
+            text = f"🟢 **Бот запущен**\n`{now}`"
+        elif msg_type == "stop":
+            text = f"🔴 **Бот остановлен**\n`{now}`"
+        elif msg_type == "heartbeat":
+            uptime = ""
+            if bot_start_time:
+                delta = datetime.datetime.now() - bot_start_time
+                hours, remainder = divmod(int(delta.total_seconds()), 3600)
+                minutes, _ = divmod(remainder, 60)
+                uptime = f"\nUptime: {hours}ч {minutes}м"
+            text = f"💚 **Heartbeat**\n`{now}`{uptime}"
+        else:
+            text = f"ℹ️ {msg_type}\n`{now}`"
+
+        await business.send_message(
+            chat_id=MONITORING_CHAT_ID,
+            text=text
+        )
+        logger.info(f"Мониторинг: отправлено уведомление типа '{msg_type}'")
+    except Exception as e:
+        logger.error(f"Ошибка отправки мониторинга: {e}")
+
+
+async def heartbeat_task():
+    """Периодическая отправка heartbeat"""
+    if not MONITORING_ENABLED or HEARTBEAT_INTERVAL <= 0:
+        return
+
+    logger.info(f"Запуск heartbeat мониторинга (интервал: {HEARTBEAT_INTERVAL} минут)")
+
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL * 60)
+        try:
+            await send_monitoring_message("heartbeat")
+        except Exception as e:
+            logger.error(f"Ошибка heartbeat: {e}")
+
+
 # функция планировщика проверок
 async def schedule_checks():
+    global bot_start_time
+
     # Начальная задержка для полной инициализации клиента
-    await asyncio.sleep(30)
-    
+    await asyncio.sleep(5)
+
+    # Записываем время запуска и отправляем уведомление
+    bot_start_time = datetime.datetime.now()
+    try:
+        await send_monitoring_message("start")
+    except Exception as e:
+        logger.error(f"Ошибка отправки start-уведомления: {e}")
+
+    # Запускаем heartbeat в отдельной задаче
+    asyncio.create_task(heartbeat_task())
+
+    # Дополнительная задержка перед первой проверкой
+    await asyncio.sleep(25)
+
     while True:
         try:
             logger.info("Запуск проверки неотвеченных сообщений...")
             await check_unanswered_messages(business)
-            
+
             # Проверяем каждые N минут согласно настройке
             await asyncio.sleep(CHECK_INTERVAL * 60)
         except Exception as e:
